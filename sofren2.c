@@ -1,3 +1,6 @@
+// IF YOU CAN SEE THIS LINE THEN I JUST FORGOT TO REMOVE IT
+#define SFT_IMPL
+
 #ifndef SFT_H
 #define SFT_H
 
@@ -99,10 +102,14 @@ typedef struct sft_instance sft_instance;
 // the angle between them is strictly greater than 100 degrees
 #define SFT_CONE_LIMIT (-0.173648f)
 
-// total of 32
-#define SFT_INSTANCE_BITS 14
-#define SFT_MESHLET_BITS 11
+// must total 31 to reserve bit 31 for clipping flag
+// 18 meshlet bits required for huge scenes like Bistro, TODO maybe balance meshlets better somehow (preprocess models)
+#define SFT_INSTANCE_BITS 6
+#define SFT_MESHLET_BITS 18
 #define SFT_TRIANGLE_BITS 7
+#if 31 != (SFT_INSTANCE_BITS + SFT_MESHLET_BITS + SFT_TRIANGLE_BITS)
+    #error "SFT ERROR: SFT_INSTANCE_BITS + SFT_MESHLET_BITS + SFT_TRIANGLE_BITS must equal 31"
+#endif
 #define SFT_MAX_INSTANCES_PER_FRAME (1 << SFT_INSTANCE_BITS)
 
 #define SFT_VERTS_PER_MESHLET 64
@@ -181,8 +188,13 @@ typedef struct sft_instance sft_instance;
     #include <immintrin.h>
     
     #define SFT_SIMD_WIDTH 8
+    #define SFT_BLOCK_X 4
+    #define SFT_BLOCK_Y 2
     typedef __m256  vf32;
     typedef __m256i vi32;
+
+    #define sft_vf_ddx(v) _mm256_sub_ps((v), _mm256_permute_ps((v), _MM_SHUFFLE(2, 3, 0, 1)))
+    #define sft_vf_ddy(v) _mm256_sub_ps((v), _mm256_permute2f128_ps((v), (v), 0x01))
 
     // ---  vf32 base and memory  ---
     #define sft_vf_setzero()            _mm256_setzero_ps()
@@ -215,6 +227,8 @@ typedef struct sft_instance sft_instance;
     #define sft_vf_cmp_le(a, b)         _mm256_cmp_ps((a), (b), _CMP_LE_OQ)
     #define sft_vf_cmp_gt(a, b)         _mm256_cmp_ps((a), (b), _CMP_GT_OQ)
     #define sft_vf_cmp_ge(a, b)         _mm256_cmp_ps((a), (b), _CMP_GE_OQ)
+    #define sft_vf_cmp_eq(a, b)         _mm256_cmp_ps((a), (b), _CMP_EQ_OQ)
+    #define sft_vf_cmp_ne(a, b)         _mm256_cmp_ps((a), (b), _CMP_NEQ_OQ)
     
     #define sft_vf_blendv(a, b, m)      _mm256_blendv_ps((b), (a), (m))
     #define sft_vf_movemask(a)          _mm256_movemask_ps(a)
@@ -245,6 +259,7 @@ typedef struct sft_instance sft_instance;
     #define sft_vi_set1(v)              _mm256_set1_epi32(v)
     #define sft_vi_load(ptr)            _mm256_load_si256((const vi32*)(ptr))
     #define sft_vi_store(ptr, val)      _mm256_store_si256((vi32*)(ptr), (val))
+    #define sft_vi_maskstore(p, m, v)   _mm256_maskstore_epi32((i32 *)(p), (m), (v))
     #define sft_vi_loadu_8u_to_32i(ptr) _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)(ptr)))
     SFT_INLINE i32 sft_vi_extract(vi32 v, i32 lane) {
         switch(lane) {
@@ -259,6 +274,7 @@ typedef struct sft_instance sft_instance;
             default: return 0;
         }
     }
+    #define sft_vi_gather(base, vind)   _mm256_i32gather_epi32((const int*)(base), (vind), 4)
 
     // ---  vi32 arithmetic and logic  ---
     #define sft_vi_add(a, b)            _mm256_add_epi32((a), (b))
@@ -267,14 +283,19 @@ typedef struct sft_instance sft_instance;
     #define sft_vi_min(a, b)            _mm256_min_epi32((a), (b))
     #define sft_vi_and(a, b)            _mm256_and_si256((a), (b))
     #define sft_vi_or(a, b)             _mm256_or_si256((a), (b))
+    #define sft_vi_andnot(a, b)         _mm256_andnot_si256((a), (b))
     #define sft_vi_srai(a, imm)         _mm256_srai_epi32((a), (imm))
     #define sft_vi_slli(a, imm)         _mm256_slli_epi32((a), (imm))
     #define sft_vi_movemask(a)          _mm256_movemask_ps(_mm256_castsi256_ps(a))
+    #define sft_vi_mullo(a, b)          _mm256_mullo_epi32((a), (b))
 
     // ---  vi32 comparisons  ---
     #define sft_vi_cmp_ge(a, b)         _mm256_cmpgt_epi32((a), _mm256_sub_epi32((b), _mm256_set1_epi32(1)))
     #define sft_vi_cmp_gt(a, b)         _mm256_cmpgt_epi32((a), (b))
     #define sft_vi_cmp_le(a, b)         _mm256_cmpgt_epi32(_mm256_add_epi32((b), _mm256_set1_epi32(1)), (a))
+    #define sft_vi_cmp_lt(a, b)         _mm256_cmpgt_epi32((b), (a))
+    #define sft_vi_cmp_eq(a, b)         _mm256_cmpeq_epi32((a), (b))
+    #define sft_vi_cmp_ne(a, b)         _mm256_xor_si256(_mm256_cmpeq_epi32((a), (b)), _mm256_set1_epi32(-1))
 
     // ---  casting  ---
     #define sft_vf_cast_vi32(a)         _mm256_castsi256_ps(a)
@@ -286,8 +307,13 @@ typedef struct sft_instance sft_instance;
     #include <arm_neon.h>
     
     #define SFT_SIMD_WIDTH 4
+    #define SFT_BLOCK_X 2
+    #define SFT_BLOCK_Y 2
     typedef float32x4_t vf32;
     typedef int32x4_t   vi32;
+
+    #define sft_vf_ddx(v) vsubq_f32((v), vrev64q_f32(v))
+    #define sft_vf_ddy(v) vsubq_f32((v), vextq_f32((v), (v), 2))
     
     // ---  vf32 base and memory  ---
     #define sft_vf_setzero()            vdupq_n_f32(0.f)
@@ -333,6 +359,8 @@ typedef struct sft_instance sft_instance;
     #define sft_vf_cmp_le(a, b)         vreinterpretq_f32_u32(vcleq_f32((a), (b)))
     #define sft_vf_cmp_gt(a, b)         vreinterpretq_f32_u32(vcgtq_f32((a), (b)))
     #define sft_vf_cmp_ge(a, b)         vreinterpretq_f32_u32(vcgeq_f32((a), (b)))
+    #define sft_vf_cmp_eq(a, b)         vreinterpretq_f32_u32(vceqq_f32((a), (b)))
+    #define sft_vf_cmp_ne(a, b)         vreinterpretq_f32_u32(vmvnq_u32(vceqq_f32((a), (b))))
 
     SFT_INLINE vf32 sft_vf_blendv(vf32 a, vf32 b, vf32 mask) {
         return vbslq_f32(vreinterpretq_u32_f32(mask), a, b);
@@ -352,6 +380,10 @@ typedef struct sft_instance sft_instance;
     #define sft_vi_set1(v)              vdupq_n_s32(v)
     #define sft_vi_load(ptr)            vld1q_s32((const i32*)(ptr))
     #define sft_vi_store(ptr, val)      vst1q_s32((i32*)(ptr), (val))
+    SFT_INLINE void sft_vi_maskstore(i32 *ptr, vi32 mask, vi32 val) {
+        const vi32 old = vld1q_s32(ptr);
+        vst1q_s32(ptr, vbslq_s32(vreinterpretq_u32_s32(mask), val, old));
+    }
     SFT_INLINE vi32 sft_vi_loadu_8u_to_32i(const u8 *ptr) {
         return vreinterpretq_s32_u32(vmovl_u16(vmovl_u8(vld1_u8(ptr))));
     }
@@ -364,6 +396,9 @@ typedef struct sft_instance sft_instance;
             default: return 0;
         }
     }
+    SFT_INLINE vi32 sft_vi_gather(const i32 *base, vi32 ind) {
+        return (vi32){ base[vgetq_lane_s32(ind, 0)], base[vgetq_lane_s32(ind, 1)], base[vgetq_lane_s32(ind, 2)], base[vgetq_lane_s32(ind, 3)] };
+    }
 
     // ---  vi32 arithmetic and logic  ---
     #define sft_vi_add(a, b)            vaddq_s32((a), (b))
@@ -372,6 +407,7 @@ typedef struct sft_instance sft_instance;
     #define sft_vi_min(a, b)            vminq_s32((a), (b))
     #define sft_vi_and(a, b)            vandq_s32((a), (b))
     #define sft_vi_or(a, b)             vorrq_s32((a), (b))
+    #define sft_vi_andnot(a, b)         vbicq_s32((b), (a))
     #define sft_vi_srai(a, imm)         vshrq_n_s32((a), (imm))
     #define sft_vi_slli(a, imm)         vshlq_n_s32((a), (imm))
     SFT_INLINE i32 sft_vi_movemask(vi32 a) {
@@ -379,11 +415,15 @@ typedef struct sft_instance sft_instance;
         const uint32x4_t bit_weights = {1, 2, 4, 8};
         return vaddvq_u32(vmulq_u32(sgn, bit_weights));
     }
+    #define sft_vi_mullo(a, b)          vmulq_s32((a), (b))
 
     // ---  vi32 comparisons  ---
     #define sft_vi_cmp_ge(a, b)         vreinterpretq_s32_u32(vcgeq_s32((a), (b)))
     #define sft_vi_cmp_gt(a, b)         vreinterpretq_s32_u32(vcgtq_s32((a), (b)))
     #define sft_vi_cmp_le(a, b)         vreinterpretq_s32_u32(vcleq_s32((a), (b)))
+    #define sft_vi_cmp_lt(a, b)         vreinterpretq_s32_u32(vcltq_s32((a), (b)))
+    #define sft_vi_cmp_eq(a, b)         vreinterpretq_s32_u32(vceqq_s32((a), (b)))
+    #define sft_vi_cmp_ne(a, b)         vreinterpretq_s32_u32(vmvnq_u32(vceqq_s32((a), (b))))
 
     // ---  casting  ---
     #define sft_vf_cast_vi32(a)         vreinterpretq_f32_s32(a)
@@ -393,9 +433,14 @@ typedef struct sft_instance sft_instance;
 
 #else
     #define SFT_SIMD_WIDTH 1
+    #define SFT_BLOCK_X 1
+    #define SFT_BLOCK_Y 1
     typedef float vf32;
     typedef i32   vi32;
     
+    #define sft_vf_ddx(v) 0.f
+    #define sft_vf_ddy(v) 0.f
+
     // ---  vf32 base and memory  ---
     #define sft_vf_setzero()            0.f
     #define sft_vf_set1(v)              (v)
@@ -433,6 +478,8 @@ typedef struct sft_instance sft_instance;
     SFT_INLINE vf32 sft_vf_cmp_le(vf32 a, vf32 b) { return (a <= b) ? -0.f : 0.f; }
     SFT_INLINE vf32 sft_vf_cmp_gt(vf32 a, vf32 b) { return (a >  b) ? -0.f : 0.f; }
     SFT_INLINE vf32 sft_vf_cmp_ge(vf32 a, vf32 b) { return (a >= b) ? -0.f : 0.f; }
+    SFT_INLINE vf32 sft_vf_cmp_eq(vf32 a, vf32 b) { return (a == b) ? -0.f : 0.f; }
+    SFT_INLINE vf32 sft_vf_cmp_ne(vf32 a, vf32 b) { return (a != b) ? -0.f : 0.f; }
 
     SFT_INLINE vf32 sft_vf_blendv(vf32 a, vf32 b, vf32 mask) {
         union { f32 f; u32 i; } u; u.f = mask;
@@ -443,16 +490,20 @@ typedef struct sft_instance sft_instance;
         return (u.i >> 31) & 1;
     }
 
-    SFT_INLINE i32 sft_vi_hmin(vi32 v) { return v; }
-    SFT_INLINE i32 sft_vi_hmax(vi32 v) { return v; }
+    #define sft_vi_hmin(v)              (v)
+    #define sft_vi_hmax(v)              (v)
 
     // ---  vi32 base and memory  ---
     #define sft_vi_setzero()            0
     #define sft_vi_set1(v)              (v)
     #define sft_vi_load(ptr)            (*(ptr))
     #define sft_vi_store(ptr, val)      (*(ptr) = (val))
+    SFT_INLINE void sft_vi_maskstore(i32 *ptr, vi32 mask, vi32 val) {
+        if ((u32)mask >> 31) { *ptr = val; }
+    }
     #define sft_vi_loadu_8u_to_32i(ptr) ((i32)*(const u8 *)(ptr))
     #define sft_vi_extract(v, lane)     (v)
+    #define sft_vi_gather(base, ind)    ((base)[(ind)])
 
     // ---  vi32 arithmetic and logic  ---
     #define sft_vi_add(a, b)            ((a) + (b))
@@ -461,14 +512,19 @@ typedef struct sft_instance sft_instance;
     #define sft_vi_min(a, b)            ((a) < (b) ? (a) : (b))
     #define sft_vi_and(a, b)            ((a) & (b))
     #define sft_vi_or(a, b)             ((a) | (b))
+    #define sft_vi_andnot(a, b)         (~(a) & (b))
     #define sft_vi_srai(a, imm)         ((a) >> (imm))
     #define sft_vi_slli(a, imm)         ((a) << (imm))
     #define sft_vi_movemask(a)          (((u32)(a) >> 31) & 1)
+    #define sft_vi_mullo(a, b)          ((a) * (b))
 
     // ---  vi32 comparisons  ---
     #define sft_vi_cmp_ge(a, b)         ((a) >= (b) ? (i32)0x80000000 : 0)
     #define sft_vi_cmp_gt(a, b)         ((a) >  (b) ? (i32)0x80000000 : 0)
     #define sft_vi_cmp_le(a, b)         ((a) <= (b) ? (i32)0x80000000 : 0)
+    #define sft_vi_cmp_lt(a, b)         ((a) <  (b) ? (i32)0x80000000 : 0)
+    #define sft_vi_cmp_eq(a, b)         ((a) == (b) ? (i32)0x80000000 : 0)
+    #define sft_vi_cmp_ne(a, b)         ((a) != (b) ? (i32)0x80000000 : 0)
 
     // ---  casting  ---
     SFT_INLINE vf32 sft_vf_cast_vi32(vi32 a) { 
@@ -731,6 +787,49 @@ typedef struct sft_model {
     u32 mesh_count;
 } sft_model;
 
+/* OLD SOFREN TEXTURE STRUCT
+    typedef struct sfrtex {
+        u32* pixels;
+        i32 w, h;
+
+        // only allocated and used for lightmaps to avoid expensive filtering
+        struct sfrRGB32 { u32 r, g, b; }* quads;
+
+        // index 0 is base texture, index 1-n are mipmaps
+        u32* allPixels[14];
+        i32 allW[14];
+        i32 allH[14];
+        
+        i32 blocksW[14];     // how many 4x4 blocks across
+        i32 strideShift[14]; // if POT, log2(blocksW) to avoid integer multiplication
+
+        i32 mipLevels; // total levels including base
+        u8 isPot;      // power of 2 flag
+    } SfrTexture;
+*/
+typedef struct sft_texture {
+    u32* pixels;
+    i32 w, h;
+
+    // struct sft_rgb32 { u32 r, g, b; }* quads;
+
+    // index 0 is for base tex, 1-N are mipmaps
+    u32* all_pixels[14];
+    i32 all_w[14], all_h[14];
+
+    i32 blocks_w[14];       // how many 4x4 blocks across
+    i32 stride_shift[14];   // if POT, log2(blocks_w)
+
+    i32 mip_levels; // total levels including base
+    u8 is_pot;      // is power of two
+} sft_texture;
+
+typedef struct sft_material {
+    sft_texture* albedo_tex;    // albedo only for now
+    u32 base_color;             // tint
+    f32 shininess;              // simple blinn phong shininess for basic specular
+} sft_material;
+
 typedef struct sft_instance {
     const struct sft_model* model;
     sftmat transform;
@@ -795,7 +894,6 @@ struct sft_clipped_triangle {
     f32 sx[3];
     f32 sy[3];
     f32 inv_w[3];
-    u32 original_vid; // store identity of the parent triangle for consistent coloring, TODO remove once resolve exists
 };
 
 struct sft_clip_vert {
@@ -818,15 +916,6 @@ struct sft_frustum {
 ================================================================*/
 
 static SFT_THREAD_LOCAL i32 sft_thread_id = 0;
-
-// diagnostic trackers for up to 32 threads
-static f64 dbg_geom_work[32] = {0};
-static f64 dbg_geom_wait[32] = {0};
-static i32 dbg_job_count[32] = {0};
-static f64 dbg_rast_work[32] = {0};
-static f64 dbg_rast_wait[32] = {0};
-static i32 dbg_tile_count[32] = {0};
-static f64 dbg_qsort_time = 0.;
 
 static struct sft_state {
     i32 thread_count;
@@ -1436,22 +1525,22 @@ SFT_INLINE sftvmat sft_vm_broadcast(sftmat m) {
 :: PRIVATE FUNCTIONS
 ================================================================*/
 
+/*
+SFT_INLINE f64 sft__get_ms(void) {
 #if defined(_WIN32)
     // windows.h is already included in memory wrappers
-    SFT_INLINE f64 sft__get_ms(void) {
-        LARGE_INTEGER freq, counter;
-        QueryPerformanceFrequency(&freq);
-        QueryPerformanceCounter(&counter);
-        return (f64)counter.QuadPart / (f64)freq.QuadPart * 1000.0;
-    }
+    LARGE_INTEGER freq, counter;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (f64)counter.QuadPart / (f64)freq.QuadPart * 1000.0;
 #else
     #include <time.h>
-    SFT_INLINE f64 sft__get_ms(void) {
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        return (f64)ts.tv_sec * 1000.0 + (f64)ts.tv_nsec / 1000000.0;
-    }
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (f64)ts.tv_sec * 1000.0 + (f64)ts.tv_nsec / 1000000.0;
 #endif
+}
+*/
 
 SFT_INLINE i32 sft__tzcnt(i32 mask) {
     #if defined(_MSC_VER)
@@ -1839,6 +1928,7 @@ static void sft__barrier_init(struct sft_barrier* b, i32 thread_count) {
     b->thread_count = thread_count;
 }
 
+// TODO, IMPORTANT, update to have preprocessing for linux
 SFT_INLINE void sft__barrier_wait(struct sft_barrier* b) {
     const i32 local_gen = b->generation;
     const i32 arrived = sft_atomic_add(&b->count, 1) + 1;
@@ -1847,18 +1937,16 @@ SFT_INLINE void sft__barrier_wait(struct sft_barrier* b) {
         // last thread to arrive resets the count and flips the generation
         b->count = 0;
         sft_atomic_add(&b->generation, 1);
+        
+        // wake all threads sleeping on the generation address
+        WakeByAddressAll((PVOID)&b->generation);
     }
     else {
-        // spin and yield CPU resources until the generation flips
-        i32 backoff = 1;
+        // sleep at the OS level until generation changes
         while (local_gen == b->generation) {
-            for (i32 i = 0; i < backoff; i += 1) {
-                sft_cpu_pause();
-            }
-            // exponential backoff
-            if (backoff < 64) {
-                backoff *= 2; 
-            }
+            // this puts the thread to sleep, yielding the CPU entirely,
+            // it will wake up when WakeByAddressAll is called, or spuriously
+            WaitOnAddress((volatile PVOID)&b->generation, (PVOID)&local_gen, sizeof(i32), INFINITE);
         }
     }
 }
@@ -2234,7 +2322,6 @@ static i32 sft__clip_triangle_near_plane(
 
 static i32 sft__project_and_store_clipped_triangle(
     const struct sft_clip_vert tri[3], 
-    u32 original_vid, 
     i32* t_clip_base, 
     i32* t_clip_count
 ) {
@@ -2262,7 +2349,6 @@ static i32 sft__project_and_store_clipped_triangle(
         out_tri->inv_w[i] = inv_w;
     }
     
-    out_tri->original_vid = original_vid;
     return slot;
 }
 
@@ -2472,12 +2558,8 @@ SFT_INLINE void sft__geom_clip_and_bin(
         struct sft_clip_vert out_tris[2][3];
         const i32 num_clipped = sft__clip_triangle_near_plane(out_tris, in_tri);
 
-        const u32 original_vid = (inst_ind << (SFT_TRIANGLE_BITS + SFT_MESHLET_BITS)) | 
-                                 (m_ind << SFT_TRIANGLE_BITS) | 
-                                 ((batch * SFT_SIMD_WIDTH) + lane);
-
         for (i32 c = 0; c < num_clipped; c += 1) {
-            const i32 slot = sft__project_and_store_clipped_triangle(out_tris[c], original_vid, t_clip_base, t_clip_count);
+            const i32 slot = sft__project_and_store_clipped_triangle(out_tris[c], t_clip_base, t_clip_count);
             const struct sft_clipped_triangle* ct = &sft_state->clip_cache.pool[slot];
 
             const f32 area = (ct->sx[1] - ct->sx[0]) * (ct->sy[2] - ct->sy[0]) - (ct->sy[1] - ct->sy[0]) * (ct->sx[2] - ct->sx[0]);
@@ -2505,14 +2587,8 @@ SFT_INLINE void sft__geom_setup_and_bin_batch(
     const f32* clip_tx, const f32* clip_ty, const f32* clip_tz, const f32* clip_w,
     const f32* scratch_sx, const f32* scratch_sy,
     struct sft_thread_bin_state* local_bins,
-    i32* t_chunk_base, i32* t_chunk_count, i32* t_clip_base, i32* t_clip_count,
-    f64* out_setup_time, f64* out_bin_time
+    i32* t_chunk_base, i32* t_chunk_count, i32* t_clip_base, i32* t_clip_count
 ) {
-    f64 t_start = 0;
-    if (0 == sft_thread_id) {
-        t_start = sft__get_ms();
-    }
-
     const u32 batch_offset = batch * (SFT_SIMD_WIDTH * 4);
     const vi32 ind_v0 = sft_vi_loadu_8u_to_32i(&m_inds->inds[batch_offset + (0 * SFT_SIMD_WIDTH)]);
     const vi32 ind_v1 = sft_vi_loadu_8u_to_32i(&m_inds->inds[batch_offset + (1 * SFT_SIMD_WIDTH)]);
@@ -2552,10 +2628,7 @@ SFT_INLINE void sft__geom_setup_and_bin_batch(
     }
 
     if (0 == sft_vf_movemask(all_inside)) {
-        if (0 == sft_thread_id) {
-            *out_setup_time += (sft__get_ms() - t_start);
-        }
-        return; 
+        return;
     }
 
     const vf32 sx0 = sft_vf_gather(scratch_sx, ind_v0);
@@ -2573,9 +2646,6 @@ SFT_INLINE void sft__geom_setup_and_bin_batch(
     const vf32 v_min_area = sft_vf_set1(0.1f);
     vf32 valid_mask = sft_vf_and(all_inside, sft_vf_cmp_gt(sft_vf_fmsub(dx1, dy2, sft_vf_mul(dy1, dx2)), v_min_area));
     if (0 == sft_vf_movemask(valid_mask)) {
-        if (0 == sft_thread_id) {
-            *out_setup_time += (sft__get_ms() - t_start);
-        }
         return;
     }
 
@@ -2594,16 +2664,7 @@ SFT_INLINE void sft__geom_setup_and_bin_batch(
 
     const u32 valid_tris = sft_vf_movemask(valid_mask);
     if (!valid_tris) {
-        if (0 == sft_thread_id) {
-            *out_setup_time += (sft__get_ms() - t_start);
-        }
         return;
-    }
-
-    if (0 == sft_thread_id) {
-        const f64 t_now = sft__get_ms();
-        *out_setup_time += (t_now - t_start);
-        t_start = t_now;
     }
 
     alignas(32) i32 s_tx0[SFT_SIMD_WIDTH], s_tx1[SFT_SIMD_WIDTH];
@@ -2630,24 +2691,12 @@ SFT_INLINE void sft__geom_setup_and_bin_batch(
                               ((u64)valid_tris << 56);
 
     sft__geom_bin_tiles(batch_payload, b_tx0, b_tx1, b_ty0, b_ty1, local_bins, t_chunk_base, t_chunk_count);
-
-    if (0 == sft_thread_id) {
-        *out_bin_time += (sft__get_ms() - t_start);
-    }
 }
 
 // geometry binning pipeline
-static void sft__worker_phase_geom(struct sft_thread_bin_state* local_bins) {
-    static f64 time_cull = 0.0;
-    static f64 time_transform = 0.0;
-    static f64 time_setup = 0.0;
-    static f64 time_bin = 0.0;
-    static i32 frames = 0;
-
+SFT_INLINE void sft__worker_phase_geom(struct sft_thread_bin_state* local_bins) {
     i32 t_chunk_base = 0, t_chunk_count = 0;
     i32 t_clip_base = 0, t_clip_count = 0;
-
-    f64 l_cull = 0.0, l_trans = 0.0, l_setup = 0.0, l_bin = 0.0;
 
     alignas(32) f32 clip_tx[64];
     alignas(32) f32 clip_ty[64];
@@ -2661,8 +2710,6 @@ static void sft__worker_phase_geom(struct sft_thread_bin_state* local_bins) {
         if (job_ind >= sft_state->cmd_queue.job_count) {
             break;
         }
-
-        dbg_job_count[sft_thread_id] += 1;
 
         const struct sft_geom_job* job = &sft_state->cmd_queue.jobs[job_ind];
         const sft_instance* inst       = &sft_state->cmd_queue.instances[job->instance_ind];
@@ -2690,11 +2737,6 @@ static void sft__worker_phase_geom(struct sft_thread_bin_state* local_bins) {
 
         for (u32 i = 0; i < job->meshlet_count; i += SFT_SIMD_WIDTH) {
             const u32 m_ind = job->meshlet_start + i;
-
-            f64 t_start = 0;
-            if (0 == sft_thread_id) {
-                t_start = sft__get_ms();
-            }
 
             // ---  meshlet culling  ---
             sftvvec center;
@@ -2726,10 +2768,6 @@ static void sft__worker_phase_geom(struct sft_thread_bin_state* local_bins) {
             
             inside_mask = sft_vf_and(inside_mask, cone_mask);
             const i32 active_meshlets = sft_vf_movemask(inside_mask);
-
-            if (0 == sft_thread_id) {
-                l_cull += (sft__get_ms() - t_start);
-            }
             
             if (0 == active_meshlets) {
                 continue;
@@ -2747,10 +2785,6 @@ static void sft__worker_phase_geom(struct sft_thread_bin_state* local_bins) {
                 const struct sft_meshlet* m_verts = &mesh->meshlets[surviving_m_ind];
                 const struct sft_meshlet_inds* m_inds = &mesh->inds[surviving_m_ind];
                 const u32 ss_m_ind = inst->ss_meshlet_offset + surviving_m_ind;
-
-                if (0 == sft_thread_id) {
-                    t_start = sft__get_ms();
-                }
 
                 // ---  vertex transforms  ---
                 for (u32 v_chunk = 0; v_chunk < (SFT_VERTS_PER_MESHLET / SFT_SIMD_WIDTH); v_chunk += 1) {
@@ -2793,18 +2827,13 @@ static void sft__worker_phase_geom(struct sft_thread_bin_state* local_bins) {
                     sft_vf_store(&sft_state->ss_cache[ss_m_ind].inv_w[v_ind], inv_w);
                 }
 
-                if (0 == sft_thread_id) {
-                    l_trans += (sft__get_ms() - t_start);
-                }
-
                 const u32 batch_count = 128 / SFT_SIMD_WIDTH;
                 for (u32 batch = 0; batch < batch_count; batch += 1) {
                     sft__geom_setup_and_bin_batch(
                         batch, job->instance_ind, surviving_m_ind, m_inds,
                         clip_tx, clip_ty, clip_tz, clip_w,
                         scratch_sx, scratch_sy,
-                        local_bins, &t_chunk_base, &t_chunk_count, &t_clip_base, &t_clip_count,
-                        &l_setup, &l_bin);
+                        local_bins, &t_chunk_base, &t_chunk_count, &t_clip_base, &t_clip_count);
                 }
             }
         }
@@ -2817,164 +2846,65 @@ static void sft__worker_phase_geom(struct sft_thread_bin_state* local_bins) {
             sft_atomic_add(&sft_state->display.tile_payload_counts[i], local_bins[i].payload_count);
         }
     }
-
-    if (0 == sft_thread_id) {
-        time_cull += l_cull;
-        time_transform += l_trans;
-        time_setup += l_setup;
-        time_bin += l_bin;
-        
-        frames += 1;
-        if (frames >= 200) {
-            SFT_PRINT("--- Geometry Sub-Phases (Thread 0 Avg) ---\n");
-            SFT_PRINT("  Meshlet Culling: %6.3f ms\n", time_cull / 200.0);
-            SFT_PRINT("  Vertex Trans:    %6.3f ms\n", time_transform / 200.0);
-            SFT_PRINT("  Triangle Setup:  %6.3f ms\n", time_setup / 200.0);
-            SFT_PRINT("  SIMD Binning:    %6.3f ms\n", time_bin / 200.0);
-            time_cull = time_transform = time_setup = time_bin = 0.0;
-            frames = 0;
-        }
-    }
 }
 
-// rasterizes a single clipped triangle
-SFT_INLINE void sft__rast_clipped_triangle(
-    u64 payload, f32* depth_buf, u32* vid_buf,
-    i32 tile_min_x, i32 tile_min_y, i32 tile_max_x, i32 tile_max_y,
-    f64* out_setup_time, f64* out_rast_time
-) {
-    f64 t_start = 0;
-    if (0 == sft_thread_id) {
-        t_start = sft__get_ms();
-    }
-
-    const u32 slot = (u32)(payload & 0xFFFFFFFF);
-    const struct sft_clipped_triangle* ct = &sft_state->clip_cache.pool[slot];
-
-    const f32 sx0 = ct->sx[0], sy0 = ct->sy[0], inv_w0 = ct->inv_w[0];
-    const f32 sx1 = ct->sx[1], sy1 = ct->sy[1], inv_w1 = ct->inv_w[1];
-    const f32 sx2 = ct->sx[2], sy2 = ct->sy[2], inv_w2 = ct->inv_w[2];
-
-    // localize vertices to the bounding box min to prevent C0 precision loss
-    const f32 fmin_x = floorf(fminf(sx0, fminf(sx1, sx2)));
-    const f32 fmin_y = floorf(fminf(sy0, fminf(sy1, sy2)));
-
-    const f32 lx0 = sx0 - fmin_x, ly0 = sy0 - fmin_y;
-    const f32 lx1 = sx1 - fmin_x, ly1 = sy1 - fmin_y;
-    const f32 lx2 = sx2 - fmin_x, ly2 = sy2 - fmin_y;
-
-    // evaluate edge equations using localized coordinates
-    const f32 A0 = ly0 - ly1, B0 = lx1 - lx0, C0 = lx0 * ly1 - ly0 * lx1;
-    const f32 A1 = ly1 - ly2, B1 = lx2 - lx1, C1 = lx1 * ly2 - ly1 * lx2;
-    const f32 A2 = ly2 - ly0, B2 = lx0 - lx2, C2 = lx2 * ly0 - ly2 * lx0;
-
-    const f32 dx1 = lx1 - lx0, dx2 = lx2 - lx0;
-    const f32 dy1 = ly1 - ly0, dy2 = ly2 - ly0;
-
-    // strict valid area check
-    const f32 det = dx1 * dy2 - dx2 * dy1;
-    if (det <= SFT_EPSILON) {
-        if (0 == sft_thread_id) {
-            *out_setup_time += (sft__get_ms() - t_start);
-        }
-        return;
-    }
-    const f32 inv_det = 1.f / det;
-
-    const f32 dzdx = ((inv_w1 - inv_w0) * dy2 - (inv_w2 - inv_w0) * dy1) * inv_det;
-    const f32 dzdy = ((inv_w2 - inv_w0) * dx1 - (inv_w1 - inv_w0) * dx2) * inv_det;
-    
-    const f32 z_base = inv_w0 - (lx0 * dzdx + ly0 * dzdy);
-
-    // set up exact pixel bounds
-    i32 min_x = (i32)fmin_x;
-    i32 max_x = (i32)ceilf(fmaxf(sx0, fmaxf(sx1, sx2)));
-    i32 min_y = (i32)fmin_y;
-    i32 max_y = (i32)ceilf(fmaxf(sy0, fmaxf(sy1, sy2)));
-    min_x = SFT_MAX(min_x, tile_min_x);
-    max_x = SFT_MIN(max_x, tile_max_x - 1);
-    min_y = SFT_MAX(min_y, tile_min_y);
-    max_y = SFT_MIN(max_y, tile_max_y - 1);
-
-    const u32 out_vid = ct->original_vid;
-
-    // evaluate edge equations relative to the bounds
-    f32 row_e0 = ((f32)min_x + 0.5f - sx0) * A0 + ((f32)min_y + 0.5f - sy0) * B0;
-    f32 row_e1 = ((f32)min_x + 0.5f - sx1) * A1 + ((f32)min_y + 0.5f - sy1) * B1;
-    f32 row_e2 = ((f32)min_x + 0.5f - sx2) * A2 + ((f32)min_y + 0.5f - sy2) * B2;
-    f32 row_z  = inv_w0 + dzdx * ((f32)min_x + 0.5f - sx0) + dzdy * ((f32)min_y + 0.5f - sy0);
-
-    if (0 == sft_thread_id) {
-        f64 t_now = sft__get_ms();
-        *out_setup_time += (t_now - t_start);
-        t_start = t_now;
-    }
-
-    // evaluate pixel centers relative to the localized origin
-    for (i32 y = min_y; y <= max_y; y += 1) {
-        f32 e0 = row_e0;
-        f32 e1 = row_e1;
-        f32 e2 = row_e2;
-        f32 z  = row_z;
-
-        i32 p_ind = (y - tile_min_y) * SFT_TILE_SIZE + (min_x - tile_min_x);
-
-        for (i32 x = min_x; x <= max_x; x += 1, e0 += A0, e1 += A1, e2 += A2, z += dzdx, p_ind += 1) {
-            if (e0 >= 0.f && e1 >= 0.f && e2 >= 0.f && z > depth_buf[p_ind]) {
-                depth_buf[p_ind] = z;
-                vid_buf[p_ind] = out_vid;
-            }
-        }
-        
-        row_e0 += B0;
-        row_e1 += B1;
-        row_e2 += B2;
-        row_z  += dzdy;
-    }
-
-    if (0 == sft_thread_id) {
-        *out_rast_time += (sft__get_ms() - t_start);
-    }
-}
-
-// rasterizes a SIMD batch
+// handles both regular and clipped triangles
 SFT_INLINE void sft__rast_simd_batch(
     u64 payload, f32* depth_buf, u32* vid_buf,
     i32 tile_min_x, i32 tile_min_y, i32 tile_max_x, i32 tile_max_y,
-    vf32 v_x_step, vf32 v_zero, vf32 v_tile_min_x, vf32 v_tile_max_x, vf32 v_tile_min_y, vf32 v_tile_max_y,
-    f64* out_setup_time, f64* out_rast_time
+    vf32 v_x_step, vf32 v_zero, vf32 v_tile_min_x, vf32 v_tile_max_x, vf32 v_tile_min_y, vf32 v_tile_max_y
 ) {
-    f64 t_start = 0;
-    if (0 == sft_thread_id) {
-        t_start = sft__get_ms();
+    const u32 raw_active = (u32)((payload >> 56) & 0xFF);
+    
+    vf32 sx0, sy0, inv_w0;
+    vf32 sx1, sy1, inv_w1;
+    vf32 sx2, sy2, inv_w2;
+    
+    u32 active_tris = 0;
+    u8 is_clipped = 0;
+    u32 inst_ind = 0, m_ind = 0, batch = 0, clip_slot = 0;
+
+    if (0 == raw_active) {
+        // ---  clipped triangle fetch  ---
+        is_clipped = 1;
+        clip_slot = (u32)(payload & 0xFFFFFFFF);
+        const struct sft_clipped_triangle* ct = &sft_state->clip_cache.pool[clip_slot];
+
+        sx0 = sft_vf_set1(ct->sx[0]); sy0 = sft_vf_set1(ct->sy[0]); inv_w0 = sft_vf_set1(ct->inv_w[0]);
+        sx1 = sft_vf_set1(ct->sx[1]); sy1 = sft_vf_set1(ct->sy[1]); inv_w1 = sft_vf_set1(ct->inv_w[1]);
+        sx2 = sft_vf_set1(ct->sx[2]); sy2 = sft_vf_set1(ct->sy[2]); inv_w2 = sft_vf_set1(ct->inv_w[2]);
+        
+        active_tris = 1; // lane 0 only
+    } 
+    else {
+        // ---  standard batch fetch  ---
+        inst_ind = (u32)(payload & 0xFFFFFF);
+        m_ind    = (u32)((payload >> 24) & 0xFFFFFF);
+        batch    = (u32)((payload >> 48) & 0xFF);
+        active_tris = raw_active;
+
+        const sft_instance* inst = &sft_state->cmd_queue.instances[inst_ind];
+        const struct sft_meshlet_inds* m_inds = &inst->model->meshes[0].inds[m_ind];
+        const u32 offset = batch * (SFT_SIMD_WIDTH * 4);
+        
+        const vi32 v_i0 = sft_vi_loadu_8u_to_32i(&m_inds->inds[offset + (0 * SFT_SIMD_WIDTH)]);
+        const vi32 v_i1 = sft_vi_loadu_8u_to_32i(&m_inds->inds[offset + (1 * SFT_SIMD_WIDTH)]);
+        const vi32 v_i2 = sft_vi_loadu_8u_to_32i(&m_inds->inds[offset + (2 * SFT_SIMD_WIDTH)]);
+
+        const u32 ss_m_ind = inst->ss_meshlet_offset + m_ind;
+        
+        sx0 = sft_vf_gather(sft_state->ss_cache[ss_m_ind].sx, v_i0);
+        sy0 = sft_vf_gather(sft_state->ss_cache[ss_m_ind].sy, v_i0);
+        inv_w0 = sft_vf_gather(sft_state->ss_cache[ss_m_ind].inv_w, v_i0);
+
+        sx1 = sft_vf_gather(sft_state->ss_cache[ss_m_ind].sx, v_i1);
+        sy1 = sft_vf_gather(sft_state->ss_cache[ss_m_ind].sy, v_i1);
+        inv_w1 = sft_vf_gather(sft_state->ss_cache[ss_m_ind].inv_w, v_i1);
+
+        sx2 = sft_vf_gather(sft_state->ss_cache[ss_m_ind].sx, v_i2);
+        sy2 = sft_vf_gather(sft_state->ss_cache[ss_m_ind].sy, v_i2);
+        inv_w2 = sft_vf_gather(sft_state->ss_cache[ss_m_ind].inv_w, v_i2);
     }
-
-    const u32 inst_ind = (u32)(payload & 0xFFFFFF);
-    const u32 m_ind    = (u32)((payload >> 24) & 0xFFFFFF);
-    const u32 batch    = (u32)((payload >> 48) & 0xFF);
-    u32 active_tris    = (u32)((payload >> 56) & 0xFF);
-
-    const sft_instance* inst = &sft_state->cmd_queue.instances[inst_ind];
-    const struct sft_meshlet_inds* m_inds = &inst->model->meshes[0].inds[m_ind];
-    const u32 offset = batch * (SFT_SIMD_WIDTH * 4);
-    
-    const vi32 v_i0 = sft_vi_loadu_8u_to_32i(&m_inds->inds[offset + (0 * SFT_SIMD_WIDTH)]);
-    const vi32 v_i1 = sft_vi_loadu_8u_to_32i(&m_inds->inds[offset + (1 * SFT_SIMD_WIDTH)]);
-    const vi32 v_i2 = sft_vi_loadu_8u_to_32i(&m_inds->inds[offset + (2 * SFT_SIMD_WIDTH)]);
-
-    const u32 ss_m_ind = inst->ss_meshlet_offset + m_ind;
-    
-    const vf32 sx0 = sft_vf_gather(sft_state->ss_cache[ss_m_ind].sx, v_i0);
-    const vf32 sy0 = sft_vf_gather(sft_state->ss_cache[ss_m_ind].sy, v_i0);
-    const vf32 inv_w0 = sft_vf_gather(sft_state->ss_cache[ss_m_ind].inv_w, v_i0);
-
-    const vf32 sx1 = sft_vf_gather(sft_state->ss_cache[ss_m_ind].sx, v_i1);
-    const vf32 sy1 = sft_vf_gather(sft_state->ss_cache[ss_m_ind].sy, v_i1);
-    const vf32 inv_w1 = sft_vf_gather(sft_state->ss_cache[ss_m_ind].inv_w, v_i1);
-
-    const vf32 sx2 = sft_vf_gather(sft_state->ss_cache[ss_m_ind].sx, v_i2);
-    const vf32 sy2 = sft_vf_gather(sft_state->ss_cache[ss_m_ind].sy, v_i2);
-    const vf32 inv_w2 = sft_vf_gather(sft_state->ss_cache[ss_m_ind].inv_w, v_i2);
 
     const vf32 A0 = sft_vf_sub(sy0, sy1), B0 = sft_vf_sub(sx1, sx0), C0 = sft_vf_sub(sft_vf_mul(sx0, sy1), sft_vf_mul(sy0, sx1));
     const vf32 A1 = sft_vf_sub(sy1, sy2), B1 = sft_vf_sub(sx2, sx1), C1 = sft_vf_sub(sft_vf_mul(sx1, sy2), sft_vf_mul(sy1, sx2));
@@ -2982,8 +2912,17 @@ SFT_INLINE void sft__rast_simd_batch(
 
     const vf32 dx1 = sft_vf_sub(sx1, sx0), dx2 = sft_vf_sub(sx2, sx0);
     const vf32 dy1 = sft_vf_sub(sy1, sy0), dy2 = sft_vf_sub(sy2, sy0);
-    const vf32 inv_det = sft_vf_rcp(sft_vf_sub(sft_vf_mul(dx1, dy2), sft_vf_mul(dx2, dy1)));
+    
+    // area culling
+    const vf32 det = sft_vf_sub(sft_vf_mul(dx1, dy2), sft_vf_mul(dx2, dy1));
+    const vf32 valid_area_mask = sft_vf_cmp_gt(det, sft_vf_set1(SFT_EPSILON));
+    active_tris &= sft_vf_movemask(valid_area_mask);
 
+    if (0 == active_tris) {
+        return;
+    }
+
+    const vf32 inv_det = sft_vf_rcp(det);
     const vf32 dzdx = sft_vf_mul(sft_vf_sub(sft_vf_mul(sft_vf_sub(inv_w1, inv_w0), dy2), sft_vf_mul(sft_vf_sub(inv_w2, inv_w0), dy1)), inv_det);
     const vf32 dzdy = sft_vf_mul(sft_vf_sub(sft_vf_mul(sft_vf_sub(inv_w2, inv_w0), dx1), sft_vf_mul(sft_vf_sub(inv_w1, inv_w0), dx2)), inv_det);
 
@@ -2991,7 +2930,7 @@ SFT_INLINE void sft__rast_simd_batch(
     const vf32 c0_abs = sft_vf_fmadd(B0, half, sft_vf_fmadd(A0, half, C0));
     const vf32 c1_abs = sft_vf_fmadd(B1, half, sft_vf_fmadd(A1, half, C1));
     const vf32 c2_abs = sft_vf_fmadd(B2, half, sft_vf_fmadd(A2, half, C2));
-    vf32 z_base_abs = sft_vf_fmadd(sft_vf_sub(half, sy0), dzdy, sft_vf_fmadd(sft_vf_sub(half, sx0), dzdx, inv_w0));
+    const vf32 z_base_abs = sft_vf_fmadd(sft_vf_sub(half, sy0), dzdy, sft_vf_fmadd(sft_vf_sub(half, sx0), dzdx, inv_w0));
 
     vf32 v_min_x = sft_vf_min(sx0, sft_vf_min(sx1, sx2));
     vf32 v_max_x = sft_vf_max(sx0, sft_vf_max(sx1, sx2));
@@ -3018,25 +2957,30 @@ SFT_INLINE void sft__rast_simd_batch(
     sft_vi_store(s_min_y, sft_vi_cvttps_epi32(v_min_y));
     sft_vi_store(s_max_y, sft_vi_cvttps_epi32(v_max_y));
 
-    if (0 == sft_thread_id) {
-        f64 t_now = sft__get_ms();
-        *out_setup_time += (t_now - t_start);
-        t_start = t_now;
-    }
-
     while (active_tris) {
         const u32 lane = sft__tzcnt(active_tris);
         active_tris &= (active_tris - 1);
         
-        const u32 vid_payload = (inst_ind << (SFT_TRIANGLE_BITS + SFT_MESHLET_BITS)) | 
-                                (m_ind << SFT_TRIANGLE_BITS) | 
-                                ((batch * SFT_SIMD_WIDTH) + lane);
-        const vf32 v_payload = sft_vf_cast_vi32(sft_vi_set1(vid_payload));
+        u32 vid_payload_scalar;
+        if (is_clipped) {
+            vid_payload_scalar = clip_slot | (1 << 31);
+        }
+        else {
+            vid_payload_scalar = (inst_ind << (SFT_TRIANGLE_BITS + SFT_MESHLET_BITS)) | 
+                                 (m_ind << SFT_TRIANGLE_BITS) | 
+                                 ((batch * SFT_SIMD_WIDTH) + lane);
+        }
+        const vf32 v_payload = sft_vf_cast_vi32(sft_vi_set1(vid_payload_scalar));
 
         const i32 min_x = s_min_x[lane];
         const i32 max_x = s_max_x[lane];
         const i32 min_y = s_min_y[lane];
         const i32 max_y = s_max_y[lane];
+
+        // if bounding box is inverted (completely off tile)
+        if (min_x > max_x || min_y > max_y) {
+            continue;
+        }
 
         const f32 lane_A0 = s_A0[lane], lane_B0 = s_B0[lane], lane_c0 = s_c0_abs[lane];
         const f32 lane_A1 = s_A1[lane], lane_B1 = s_B1[lane], lane_c1 = s_c1_abs[lane];
@@ -3046,180 +2990,319 @@ SFT_INLINE void sft__rast_simd_batch(
         const i32 aligned_min_x = min_x & ~(SFT_SIMD_WIDTH - 1);
         const i32 aligned_max_x = (max_x & ~(SFT_SIMD_WIDTH - 1)) + SFT_SIMD_WIDTH;
 
-        const vf32 v_A0_step = sft_vf_mul(sft_vf_set1(lane_A0), v_x_step);
-        const vf32 v_A1_step = sft_vf_mul(sft_vf_set1(lane_A1), v_x_step);
-        const vf32 v_A2_step = sft_vf_mul(sft_vf_set1(lane_A2), v_x_step);
+        const f32 start_e0 = lane_c0 + lane_A0 * (f32)aligned_min_x + lane_B0 * (f32)min_y;
+        const f32 start_e1 = lane_c1 + lane_A1 * (f32)aligned_min_x + lane_B1 * (f32)min_y;
+        const f32 start_e2 = lane_c2 + lane_A2 * (f32)aligned_min_x + lane_B2 * (f32)min_y;
+        const f32 start_z  = lane_z_base + lane_dzdx * (f32)aligned_min_x + lane_dzdy * (f32)min_y;
+
+        // ---  trivial accept  ---
+        const f32 box_w = (f32)(aligned_max_x - 1 - aligned_min_x);
+        const f32 box_h = (f32)(max_y - min_y);
+
+        // absolute minimum value for each edge inside this specific bounding box
+        const f32 min_e0 = start_e0 + (lane_A0 < 0.f ? lane_A0 * box_w : 0.f) + (lane_B0 < 0.f ? lane_B0 * box_h : 0.f);
+        const f32 min_e1 = start_e1 + (lane_A1 < 0.f ? lane_A1 * box_w : 0.f) + (lane_B1 < 0.f ? lane_B1 * box_h : 0.f);
+        const f32 min_e2 = start_e2 + (lane_A2 < 0.f ? lane_A2 * box_w : 0.f) + (lane_B2 < 0.f ? lane_B2 * box_h : 0.f);
+
+        const i32 trivial_accept = (min_e0 >= 0.f && min_e1 >= 0.f && min_e2 >= 0.f);
+
+        const vf32 v_dzdx_chunk = sft_vf_set1(lane_dzdx * SFT_SIMD_WIDTH);
         const vf32 v_dzdx_step = sft_vf_mul(sft_vf_set1(lane_dzdx), v_x_step);
-        
-        const vf32 v_B0 = sft_vf_set1(lane_B0);
-        const vf32 v_B1 = sft_vf_set1(lane_B1);
-        const vf32 v_B2 = sft_vf_set1(lane_B2);
         const vf32 v_dzdy = sft_vf_set1(lane_dzdy);
+        vf32 v_z_row = sft_vf_add(sft_vf_set1(start_z), v_dzdx_step);
 
-        if (aligned_max_x - aligned_min_x == SFT_SIMD_WIDTH) {
-            const f32 base_e0 = lane_c0 + lane_A0 * (f32)aligned_min_x + lane_B0 * (f32)min_y;
-            const f32 base_e1 = lane_c1 + lane_A1 * (f32)aligned_min_x + lane_B1 * (f32)min_y;
-            const f32 base_e2 = lane_c2 + lane_A2 * (f32)aligned_min_x + lane_B2 * (f32)min_y;
-            
-            vf32 v_e0 = sft_vf_add(sft_vf_set1(base_e0), v_A0_step);
-            vf32 v_e1 = sft_vf_add(sft_vf_set1(base_e1), v_A1_step);
-            vf32 v_e2 = sft_vf_add(sft_vf_set1(base_e2), v_A2_step);
-            vf32 v_z  = sft_vf_add(sft_vf_set1(lane_z_base + lane_dzdx * (f32)aligned_min_x + lane_dzdy * (f32)min_y), v_dzdx_step);
-
+        if (trivial_accept) {
+            // ---  fast path, Z only  ---
             for (i32 y = min_y; y <= max_y; y += 1) {
-                const i32 p_ind = (y - tile_min_y) * SFT_TILE_SIZE + (aligned_min_x - tile_min_x);
-                const vf32 geom_mask = sft_vf_and(sft_vf_cmp_ge(v_e0, v_zero), 
-                                 sft_vf_and(sft_vf_cmp_ge(v_e1, v_zero), sft_vf_cmp_ge(v_e2, v_zero)));
-                
-                if (sft_vf_movemask(geom_mask)) {
+                vf32 v_z = v_z_row;
+                i32 p_ind = (y - tile_min_y) * SFT_TILE_SIZE + (aligned_min_x - tile_min_x);
+
+                for (i32 x = aligned_min_x; x < aligned_max_x; x += SFT_SIMD_WIDTH, p_ind += SFT_SIMD_WIDTH) {
                     const vf32 old_z = sft_vf_load(&depth_buf[p_ind]);
-                    const vf32 final_mask = sft_vf_and(geom_mask, sft_vf_cmp_gt(v_z, old_z));
+                    const vf32 final_mask = sft_vf_cmp_gt(v_z, old_z);
                     
-                    if (sft_vf_movemask(final_mask)) {
+                    const i32 m_int = sft_vf_movemask(final_mask);
+                    if (((1 << SFT_SIMD_WIDTH) - 1) == m_int) {
+                        sft_vf_store(&depth_buf[p_ind], v_z);
+                        sft_vf_store((f32*)&vid_buf[p_ind], v_payload); 
+                    }
+                    else if (m_int) {
                         sft_vf_store(&depth_buf[p_ind], sft_vf_blendv(v_z, old_z, final_mask));
                         const vf32 old_p = sft_vf_load((f32*)&vid_buf[p_ind]);
                         sft_vf_store((f32*)&vid_buf[p_ind], sft_vf_blendv(v_payload, old_p, final_mask));
                     }
+                    v_z = sft_vf_add(v_z, v_dzdx_chunk);
                 }
-                v_e0 = sft_vf_add(v_e0, v_B0);
-                v_e1 = sft_vf_add(v_e1, v_B1);
-                v_e2 = sft_vf_add(v_e2, v_B2);
-                v_z  = sft_vf_add(v_z, v_dzdy);
+                v_z_row = sft_vf_add(v_z_row, v_dzdy);
             }
-            continue; 
-        }
+        } 
+        else {
+            // ---  standard path, edge equations  ---
+            const vf32 v_A0_chunk = sft_vf_set1(lane_A0 * SFT_SIMD_WIDTH);
+            const vf32 v_A1_chunk = sft_vf_set1(lane_A1 * SFT_SIMD_WIDTH);
+            const vf32 v_A2_chunk = sft_vf_set1(lane_A2 * SFT_SIMD_WIDTH);
+            
+            const vf32 v_B0 = sft_vf_set1(lane_B0);
+            const vf32 v_B1 = sft_vf_set1(lane_B1);
+            const vf32 v_B2 = sft_vf_set1(lane_B2);
 
-        const f32 lane_max_offset = (f32)(SFT_SIMD_WIDTH - 1);
+            const vf32 v_A0_step = sft_vf_mul(sft_vf_set1(lane_A0), v_x_step);
+            const vf32 v_A1_step = sft_vf_mul(sft_vf_set1(lane_A1), v_x_step);
+            const vf32 v_A2_step = sft_vf_mul(sft_vf_set1(lane_A2), v_x_step);
 
-        const f32 e0_max_offset = SFT_MAX(0.f, lane_A0 * lane_max_offset) + SFT_MAX(0.f, lane_B0 * lane_max_offset);
-        const f32 e1_max_offset = SFT_MAX(0.f, lane_A1 * lane_max_offset) + SFT_MAX(0.f, lane_B1 * lane_max_offset);
-        const f32 e2_max_offset = SFT_MAX(0.f, lane_A2 * lane_max_offset) + SFT_MAX(0.f, lane_B2 * lane_max_offset);
+            vf32 v_e0_row = sft_vf_add(sft_vf_set1(start_e0), v_A0_step);
+            vf32 v_e1_row = sft_vf_add(sft_vf_set1(start_e1), v_A1_step);
+            vf32 v_e2_row = sft_vf_add(sft_vf_set1(start_e2), v_A2_step);
 
-        const f32 e0_min_offset = SFT_MIN(0.f, lane_A0 * lane_max_offset) + SFT_MIN(0.f, lane_B0 * lane_max_offset);
-        const f32 e1_min_offset = SFT_MIN(0.f, lane_A1 * lane_max_offset) + SFT_MIN(0.f, lane_B1 * lane_max_offset);
-        const f32 e2_min_offset = SFT_MIN(0.f, lane_A2 * lane_max_offset) + SFT_MIN(0.f, lane_B2 * lane_max_offset);
-
-        for (i32 y_block = (min_y & ~(SFT_SIMD_WIDTH - 1)); y_block <= max_y; y_block += SFT_SIMD_WIDTH) {
-            const i32 start_y = SFT_MAX(min_y, y_block);
-            const i32 end_y = SFT_MIN(max_y, y_block + SFT_SIMD_WIDTH - 1);
-
-            for (i32 x_block = aligned_min_x; x_block < aligned_max_x; x_block += SFT_SIMD_WIDTH) {
-                const f32 base_e0 = lane_c0 + lane_A0 * (f32)x_block + lane_B0 * (f32)y_block;
-                const f32 base_e1 = lane_c1 + lane_A1 * (f32)x_block + lane_B1 * (f32)y_block;
-                const f32 base_e2 = lane_c2 + lane_A2 * (f32)x_block + lane_B2 * (f32)y_block;
+            for (i32 y = min_y; y <= max_y; y += 1) {
+                vf32 v_e0 = v_e0_row;
+                vf32 v_e1 = v_e1_row;
+                vf32 v_e2 = v_e2_row;
+                vf32 v_z  = v_z_row;
                 
-                if (base_e0 + e0_max_offset < 0.f || 
-                    base_e1 + e1_max_offset < 0.f || 
-                    base_e2 + e2_max_offset < 0.f
-                ) {
-                    continue;
-                }
+                i32 p_ind = (y - tile_min_y) * SFT_TILE_SIZE + (aligned_min_x - tile_min_x);
 
-                u8 is_full = (base_e0 + e0_min_offset >= 0.f) && 
-                             (base_e1 + e1_min_offset >= 0.f) && 
-                             (base_e2 + e2_min_offset >= 0.f);
-
-                const f32 row_e0 = lane_c0 + lane_A0 * (f32)x_block + lane_B0 * (f32)start_y;
-                const f32 row_e1 = lane_c1 + lane_A1 * (f32)x_block + lane_B1 * (f32)start_y;
-                const f32 row_e2 = lane_c2 + lane_A2 * (f32)x_block + lane_B2 * (f32)start_y;
-                const f32 row_z  = lane_z_base + lane_dzdx * (f32)x_block + lane_dzdy * (f32)start_y;
-
-                vf32 v_e0 = sft_vf_add(sft_vf_set1(row_e0), v_A0_step);
-                vf32 v_e1 = sft_vf_add(sft_vf_set1(row_e1), v_A1_step);
-                vf32 v_e2 = sft_vf_add(sft_vf_set1(row_e2), v_A2_step);
-                vf32 v_z  = sft_vf_add(sft_vf_set1(row_z), v_dzdx_step);
-
-                if (is_full) {
-                    for (i32 y = start_y; y <= end_y; y += 1) {
-                        const i32 p_ind = (y - tile_min_y) * SFT_TILE_SIZE + (x_block - tile_min_x);
-                        
+                for (i32 x = aligned_min_x; x < aligned_max_x; x += SFT_SIMD_WIDTH, p_ind += SFT_SIMD_WIDTH) {
+                    const vf32 geom_mask = sft_vf_and(sft_vf_cmp_ge(v_e0, v_zero), 
+                                           sft_vf_and(sft_vf_cmp_ge(v_e1, v_zero), sft_vf_cmp_ge(v_e2, v_zero)));
+                    
+                    if (sft_vf_movemask(geom_mask)) {
                         const vf32 old_z = sft_vf_load(&depth_buf[p_ind]);
-                        const vf32 depth_mask = sft_vf_cmp_gt(v_z, old_z);
+                        const vf32 final_mask = sft_vf_and(geom_mask, sft_vf_cmp_gt(v_z, old_z));
                         
-                        const i32 m_int = sft_vf_movemask(depth_mask);
-                        if (((1 << SFT_SIMD_WIDTH) - 1) == m_int) { 
+                        const i32 m_int = sft_vf_movemask(final_mask);
+                        if (((1 << SFT_SIMD_WIDTH) - 1) == m_int) {
                             sft_vf_store(&depth_buf[p_ind], v_z);
-                            sft_vf_store((f32*)&vid_buf[p_ind], v_payload);
+                            sft_vf_store((f32*)&vid_buf[p_ind], v_payload); 
                         }
                         else if (m_int) {
-                            sft_vf_store(&depth_buf[p_ind], sft_vf_blendv(v_z, old_z, depth_mask));
+                            sft_vf_store(&depth_buf[p_ind], sft_vf_blendv(v_z, old_z, final_mask));
                             const vf32 old_p = sft_vf_load((f32*)&vid_buf[p_ind]);
-                            sft_vf_store((f32*)&vid_buf[p_ind], sft_vf_blendv(v_payload, old_p, depth_mask));
+                            sft_vf_store((f32*)&vid_buf[p_ind], sft_vf_blendv(v_payload, old_p, final_mask));
                         }
-                        v_z = sft_vf_add(v_z, v_dzdy);
                     }
+                    
+                    v_e0 = sft_vf_add(v_e0, v_A0_chunk);
+                    v_e1 = sft_vf_add(v_e1, v_A1_chunk);
+                    v_e2 = sft_vf_add(v_e2, v_A2_chunk);
+                    v_z  = sft_vf_add(v_z, v_dzdx_chunk);
                 }
-                else {
-                    for (i32 y = start_y; y <= end_y; y += 1) {
-                        const vf32 geom_mask = sft_vf_and(sft_vf_cmp_ge(v_e0, v_zero), 
-                                         sft_vf_and(sft_vf_cmp_ge(v_e1, v_zero), sft_vf_cmp_ge(v_e2, v_zero)));
-                        
-                        if (sft_vf_movemask(geom_mask)) {
-                            const i32 p_ind = (y - tile_min_y) * SFT_TILE_SIZE + (x_block - tile_min_x);
-                            
-                            const vf32 old_z = sft_vf_load(&depth_buf[p_ind]);
-                            const vf32 final_mask = sft_vf_and(geom_mask, sft_vf_cmp_gt(v_z, old_z));
-                            
-                            if (sft_vf_movemask(final_mask)) {
-                                sft_vf_store(&depth_buf[p_ind], sft_vf_blendv(v_z, old_z, final_mask));
-                                const vf32 old_p = sft_vf_load((f32*)&vid_buf[p_ind]);
-                                sft_vf_store((f32*)&vid_buf[p_ind], sft_vf_blendv(v_payload, old_p, final_mask));
-                            }
-                        }
-                        v_e0 = sft_vf_add(v_e0, v_B0);
-                        v_e1 = sft_vf_add(v_e1, v_B1);
-                        v_e2 = sft_vf_add(v_e2, v_B2);
-                        v_z  = sft_vf_add(v_z, v_dzdy);
-                    }
-                }
+                
+                v_e0_row = sft_vf_add(v_e0_row, v_B0);
+                v_e1_row = sft_vf_add(v_e1_row, v_B1);
+                v_e2_row = sft_vf_add(v_e2_row, v_B2);
+                v_z_row  = sft_vf_add(v_z_row, v_dzdy);
             }
         }
-    }
-    if (0 == sft_thread_id) {
-        *out_rast_time += (sft__get_ms() - t_start);
     }
 }
 
-// outputs the tile buffer to the main screen, temporarily since the resolve phase doesn't exist
-SFT_INLINE void sft__rast_output_tile(
-    const u32* vid_buf, i32 tile_min_x, i32 tile_min_y
+SFT_INLINE void sft__resolve_tile(
+    const f32* depth_buf, const u32* vid_buf,
+    i32 tile_min_x, i32 tile_min_y
 ) {
     const i32 screen_w = (i32)(sft_state->display.half_width * 2.f);
     const i32 screen_h = (i32)(sft_state->display.half_height * 2.f);
 
-    for (i32 y = 0; y < SFT_TILE_SIZE; y += 1) {
-        const i32 global_y = tile_min_y + y;
-        if (global_y >= screen_h) {
-            break;
-        }
+    const i32 limit_x = SFT_MIN(tile_min_x + SFT_TILE_SIZE, screen_w);
+    const i32 limit_y = SFT_MIN(tile_min_y + SFT_TILE_SIZE, screen_h);
 
-        for (i32 x = 0; x < SFT_TILE_SIZE; x += 1) {
-            const i32 global_x = tile_min_x + x;
-            if (global_x >= screen_w) {
-                break;
-            }
+    const vf32 v_zero = sft_vf_setzero();
+    const vf32 v_one = sft_vf_set1(1.f);
+    const vi32 v_empty_vid = sft_vi_set1(0xFFFFFFFF);
+    const vf32 v_255 = sft_vf_set1(255.f);
+    const vi32 v_screen_w = sft_vi_set1(screen_w);
+    const vi32 v_tile_size = sft_vi_set1(SFT_TILE_SIZE);
+
+    // ---  2D block offsets  ---
+    #if SFT_SIMD_WIDTH == 8
+        alignas(32) const f32 x_offsets_arr[8]  = {0.f, 1.f, 2.f, 3.f, 0.f, 1.f, 2.f, 3.f};
+        alignas(32) const f32 y_offsets_arr[8]  = {0.f, 0.f, 0.f, 0.f, 1.f, 1.f, 1.f, 1.f};
+        alignas(32) const i32 ix_offsets_arr[8] = {0, 1, 2, 3, 0, 1, 2, 3};
+        alignas(32) const i32 iy_offsets_arr[8] = {0, 0, 0, 0, 1, 1, 1, 1};
+    #elif SFT_SIMD_WIDTH == 4
+        alignas(16) const f32 x_offsets_arr[4]  = {0.f, 1.f, 0.f, 1.f};
+        alignas(16) const f32 y_offsets_arr[4]  = {0.f, 0.f, 1.f, 1.f};
+        alignas(16) const i32 ix_offsets_arr[4] = {0, 1, 0, 1};
+        alignas(16) const i32 iy_offsets_arr[4] = {0, 0, 1, 1};
+    #else
+        const f32 x_offsets_arr[1]  = {0.f};
+        const f32 y_offsets_arr[1]  = {0.f};
+        const i32 ix_offsets_arr[1] = {0};
+        const i32 iy_offsets_arr[1] = {0};
+    #endif
+
+    const vf32 v_x_offsets = sft_vf_load(x_offsets_arr);
+    const vf32 v_y_offsets = sft_vf_load(y_offsets_arr);
+    const vi32 v_ix_offsets = sft_vi_load(ix_offsets_arr);
+    const vi32 v_iy_offsets = sft_vi_load(iy_offsets_arr);
+
+    for (i32 y = tile_min_y; y < limit_y; y += SFT_BLOCK_Y) {
+        for (i32 x = tile_min_x; x < limit_x; x += SFT_BLOCK_X) {
             
-            const u32 payload = vid_buf[y * SFT_TILE_SIZE + x];
-            if (0xFFFFFFFF == payload) {
+            // ---  2D block coord generation  ---
+            const vi32 v_global_x = sft_vi_add(sft_vi_set1(x), v_ix_offsets);
+            const vi32 v_global_y = sft_vi_add(sft_vi_set1(y), v_iy_offsets);
+            const vf32 v_px = sft_vf_add(sft_vf_set1((f32)x + 0.5f), v_x_offsets);
+            const vf32 v_py = sft_vf_add(sft_vf_set1((f32)y + 0.5f), v_y_offsets);
+
+            // bounds check handles pixels that bleed off the bottom/right edges of the screen
+            const vi32 v_in_bounds = sft_vi_and(
+                sft_vi_cmp_gt(v_screen_w, v_global_x),
+                sft_vi_cmp_gt(sft_vi_set1(screen_h), v_global_y)
+            );
+
+            // ---  gather 2D visibility buffer  ---
+            const vi32 v_local_x = sft_vi_sub(v_global_x, sft_vi_set1(tile_min_x));
+            const vi32 v_local_y = sft_vi_sub(v_global_y, sft_vi_set1(tile_min_y));
+            const vi32 v_p_ind = sft_vi_add(sft_vi_mullo(v_local_y, v_tile_size), v_local_x);
+            
+            const vi32 v_vids = sft_vi_gather((const int*)vid_buf, v_p_ind);
+            
+            const vi32 v_is_empty = sft_vi_cmp_eq(v_vids, v_empty_vid);
+            const vi32 v_is_valid = sft_vi_andnot(v_is_empty, v_in_bounds);
+            
+            i32 active_pixels = sft_vi_movemask(v_is_valid) & ((1 << SFT_SIMD_WIDTH) - 1);
+
+            // draw background TODO TODO TODO
+            i32 empty_mask = sft_vi_movemask(sft_vi_and(v_is_empty, v_in_bounds)) & ((1 << SFT_SIMD_WIDTH) - 1);
+            while (empty_mask) {
+                const i32 lane = sft__tzcnt(empty_mask);
+                empty_mask &= (empty_mask - 1);
+                const i32 px = x + ix_offsets_arr[lane];
+                const i32 py = y + iy_offsets_arr[lane];
+                sft_state->display.color_buffer[py * screen_w + px] = 0xFF222222;
+            }
+
+            if (0 == active_pixels) {
                 continue;
             }
 
-            const u32 color = ((payload + 1) * 0x2E3A1941) | 0xFF000000;
-            sft_state->display.color_buffer[global_y * screen_w + global_x] = color;
+            while (active_pixels) {
+                const i32 first_lane = sft__tzcnt(active_pixels);
+                
+                // extract target vid from the scalar array representation of the lane
+                // must use a scalar array load here because the vids array is contiguous 1D memory, 
+                // but the 2D block's actual visibility data was gathered into the vector register
+                alignas(32) u32 s_vids[SFT_SIMD_WIDTH];
+                sft_vi_store((vi32*)s_vids, v_vids);
+                const u32 target_vid = s_vids[first_lane];
+
+                const vi32 v_target_vid = sft_vi_set1(target_vid);
+                const vi32 v_tri_mask = sft_vi_and(sft_vi_cmp_eq(v_vids, v_target_vid), v_in_bounds);
+                
+                const i32 tri_lanes = sft_vi_movemask(v_tri_mask) & active_pixels;
+                active_pixels &= ~tri_lanes;
+
+                // temporary info
+                const u32 is_clipped = target_vid & (1U << 31);
+                if (is_clipped) {
+                    i32 store_mask = tri_lanes;
+                    while (store_mask) {
+                        const i32 lane = sft__tzcnt(store_mask);
+                        store_mask &= (store_mask - 1);
+                        const i32 px = x + ix_offsets_arr[lane];
+                        const i32 py = y + iy_offsets_arr[lane];
+                        sft_state->display.color_buffer[py * screen_w + px] = 0xFFFF00FF;
+                    }
+                    continue;
+                }
+
+                // decode VID
+                const u32 inst_ind  = (target_vid >> (SFT_TRIANGLE_BITS + SFT_MESHLET_BITS)) & ((1 << SFT_INSTANCE_BITS) - 1);
+                const u32 m_ind     = (target_vid >> SFT_TRIANGLE_BITS) & ((1 << SFT_MESHLET_BITS) - 1);
+                const u32 local_tri = target_vid & ((1 << SFT_TRIANGLE_BITS) - 1);
+
+                const sft_instance* inst = &sft_state->cmd_queue.instances[inst_ind];
+                const struct sft_meshlet_inds* m_inds = &inst->model->meshes[0].inds[m_ind];
+                const struct sft_meshlet_attribs* m_attribs = &inst->model->meshes[0].meshlet_attribs[m_ind];
+                const u32 ss_m_ind = inst->ss_meshlet_offset + m_ind;
+
+                // match geometry builder chunking format
+                const u32 batch = local_tri / SFT_SIMD_WIDTH;
+                const u32 lane  = local_tri % SFT_SIMD_WIDTH;
+                const u32 batch_offset = batch * (SFT_SIMD_WIDTH * 4);
+
+                const u8 i0 = m_inds->inds[batch_offset + (0 * SFT_SIMD_WIDTH) + lane];
+                const u8 i1 = m_inds->inds[batch_offset + (1 * SFT_SIMD_WIDTH) + lane];
+                const u8 i2 = m_inds->inds[batch_offset + (2 * SFT_SIMD_WIDTH) + lane];
+
+                // fetch screen space data
+                const vf32 sx0 = sft_vf_set1(sft_state->ss_cache[ss_m_ind].sx[i0]);
+                const vf32 sy0 = sft_vf_set1(sft_state->ss_cache[ss_m_ind].sy[i0]);
+                const vf32 inv_w0 = sft_vf_set1(sft_state->ss_cache[ss_m_ind].inv_w[i0]);
+                
+                const vf32 sx1 = sft_vf_set1(sft_state->ss_cache[ss_m_ind].sx[i1]);
+                const vf32 sy1 = sft_vf_set1(sft_state->ss_cache[ss_m_ind].sy[i1]);
+                const vf32 inv_w1 = sft_vf_set1(sft_state->ss_cache[ss_m_ind].inv_w[i1]);
+                
+                const vf32 sx2 = sft_vf_set1(sft_state->ss_cache[ss_m_ind].sx[i2]);
+                const vf32 sy2 = sft_vf_set1(sft_state->ss_cache[ss_m_ind].sy[i2]);
+                const vf32 inv_w2 = sft_vf_set1(sft_state->ss_cache[ss_m_ind].inv_w[i2]);
+
+                // fetch UVs
+                const vf32 u0 = sft_vf_set1(m_attribs->u[i0]), v0 = sft_vf_set1(m_attribs->v[i0]);
+                const vf32 u1 = sft_vf_set1(m_attribs->u[i1]), v1 = sft_vf_set1(m_attribs->v[i1]);
+                const vf32 u2 = sft_vf_set1(m_attribs->u[i2]), v2 = sft_vf_set1(m_attribs->v[i2]);
+
+                // ---  unconditional barycentric setup  ---
+                // evaluate the plane equations for all lanes in the block, even if they aren't part 
+                // of the current triangle so the DDX/DDY math stays stable across the entire 2D stamp
+                const vf32 v_dx1 = sft_vf_sub(sx1, sx0), v_dx2 = sft_vf_sub(sx2, sx0);
+                const vf32 v_dy1 = sft_vf_sub(sy1, sy0), v_dy2 = sft_vf_sub(sy2, sy0);
+                const vf32 v_inv_det = sft_vf_rcp(sft_vf_sub(sft_vf_mul(v_dx1, v_dy2), sft_vf_mul(v_dx2, v_dy1)));
+
+                const vf32 v_px_sub_sx0 = sft_vf_sub(v_px, sx0);
+                const vf32 v_py_sub_sy0 = sft_vf_sub(v_py, sy0);
+
+                const vf32 bu = sft_vf_mul(sft_vf_sub(sft_vf_mul(v_px_sub_sx0, v_dy2), sft_vf_mul(v_py_sub_sy0, v_dx2)), v_inv_det);
+                const vf32 bv = sft_vf_mul(sft_vf_sub(sft_vf_mul(v_py_sub_sy0, v_dx1), sft_vf_mul(v_px_sub_sx0, v_dy1)), v_inv_det);
+                const vf32 bw = sft_vf_sub(sft_vf_sub(v_one, bu), bv);
+
+                const vf32 v_inv_z = sft_vf_fmadd(bw, inv_w0, sft_vf_fmadd(bu, inv_w1, sft_vf_mul(bv, inv_w2)));
+                const vf32 v_z = sft_vf_rcp(v_inv_z);
+
+                const vf32 pW0 = sft_vf_mul(sft_vf_mul(bw, inv_w0), v_z);
+                const vf32 pW1 = sft_vf_mul(sft_vf_mul(bu, inv_w1), v_z);
+                const vf32 pW2 = sft_vf_mul(sft_vf_mul(bv, inv_w2), v_z);
+
+                const vf32 cu = sft_vf_fmadd(pW0, u0, sft_vf_fmadd(pW1, u1, sft_vf_mul(pW2, u2)));
+                const vf32 cv = sft_vf_fmadd(pW0, v0, sft_vf_fmadd(pW1, v1, sft_vf_mul(pW2, v2)));
+
+                // ---  screen space derivatives  ---
+                // generates the horizontal and vertical UV gradients
+                const vf32 ddx_u = sft_vf_ddx(cu);
+                const vf32 ddy_u = sft_vf_ddy(cu);
+                const vf32 ddx_v = sft_vf_ddx(cv);
+                const vf32 ddy_v = sft_vf_ddy(cv);
+
+                // ---  visualization and masked store  ---
+                // map UVs [0.0, 1.0] to [0, 255]
+                const vf32 out_r = sft_vf_mul(sft_vf_max(v_zero, sft_vf_min(cu, v_one)), v_255);
+                const vf32 out_g = sft_vf_mul(sft_vf_max(v_zero, sft_vf_min(cv, v_one)), v_255);
+                const vf32 out_b = v_zero;
+
+                const vi32 v_color = sft_vi_or(sft_vi_set1(0xFF000000),
+                    sft_vi_or(sft_vi_slli(sft_vi_cvttps_epi32(out_r), 16),
+                    sft_vi_or(sft_vi_slli(sft_vi_cvttps_epi32(out_g), 8), sft_vi_cvttps_epi32(out_b))));
+
+                // because SIMD register represents a 2D block, memory isn't contiguous,
+                // extract and store the final colors individually based on the target mask
+                i32 store_mask = tri_lanes;
+                while (store_mask) {
+                    const i32 lane = sft__tzcnt(store_mask);
+                    store_mask &= (store_mask - 1);
+                    const i32 px = x + ix_offsets_arr[lane];
+                    const i32 py = y + iy_offsets_arr[lane];
+                    sft_state->display.color_buffer[py * screen_w + px] = sft_vi_extract(v_color, lane);
+                }
+            }
         }
     }
 }
 
 // main rasterization pipeline
-static void sft__worker_phase_rasterize(void) {
-    static f64 time_clear = 0.0;
-    static f64 time_setup = 0.0;
-    static f64 time_raster = 0.0;
-    static f64 time_output = 0.0;
-    static i32 frames = 0;
-
-    f64 l_clear = 0.0, l_setup = 0.0, l_raster = 0.0, l_output = 0.0;
-
+SFT_INLINE void sft__worker_phase_rasterize(void) {
     const i32 cols = sft_state->display.tile_cols;
     const i32 rows = sft_state->display.tile_rows;
     const i32 total_tiles = cols * rows;
@@ -3237,8 +3320,6 @@ static void sft__worker_phase_rasterize(void) {
             break;
         }
 
-        dbg_tile_count[sft_thread_id] += 1;
-
         const i32 tile_ind = sft_state->display.sorted_tiles[queue_ind];
         
         const i32 tile_x = tile_ind % cols;
@@ -3249,17 +3330,8 @@ static void sft__worker_phase_rasterize(void) {
         const i32 tile_max_x = tile_min_x + SFT_TILE_SIZE;
         const i32 tile_max_y = tile_min_y + SFT_TILE_SIZE;
 
-        f64 t_start = 0;
-        if (0 == sft_thread_id) {
-            t_start = sft__get_ms();
-        }
-
         memset(depth_buf, 0, SFT_TILE_SIZE * SFT_TILE_SIZE * sizeof(f32));
         memset(vid_buf, 0xFF, SFT_TILE_SIZE * SFT_TILE_SIZE * sizeof(u32));
-
-        if (0 == sft_thread_id) {
-            l_clear += (sft__get_ms() - t_start);
-        }
 
         i32 current_chunk_ind = sft_state->display.tile_heads[tile_ind];
 
@@ -3277,52 +3349,15 @@ static void sft__worker_phase_rasterize(void) {
                     break;
                 }
 
-                const u32 valid_tris_mask = (u32)((payload >> 56) & 0xFF);
-
-                if (0 == valid_tris_mask) {
-                    sft__rast_clipped_triangle(
-                        payload, depth_buf, vid_buf,
-                        tile_min_x, tile_min_y, tile_max_x, tile_max_y,
-                        &l_setup, &l_raster);
-                    continue;
-                }
-
                 sft__rast_simd_batch(
                     payload, depth_buf, vid_buf,
                     tile_min_x, tile_min_y, tile_max_x, tile_max_y,
-                    v_x_step, v_zero, v_tile_min_x, v_tile_max_x, v_tile_min_y, v_tile_max_y,
-                    &l_setup, &l_raster);
+                    v_x_step, v_zero, v_tile_min_x, v_tile_max_x, v_tile_min_y, v_tile_max_y);
             }
             current_chunk_ind = chunk->next_ind;
         }
 
-        if (0 == sft_thread_id) {
-            t_start = sft__get_ms();
-        }
-
-        sft__rast_output_tile(vid_buf, tile_min_x, tile_min_y);
-        
-        if (0 == sft_thread_id) {
-            l_output += (sft__get_ms() - t_start);
-        }
-    }
-    
-    if (0 == sft_thread_id) {
-        time_clear += l_clear;
-        time_setup += l_setup;
-        time_raster += l_raster;
-        time_output += l_output;
-
-        frames += 1;
-        if (frames >= 200) {
-            SFT_PRINT("--- Rasterize Sub-Phases (Thread 0 Avg) ---\n");
-            SFT_PRINT("  Buffer Clear:   %6.3f ms\n", time_clear / 200.0);
-            SFT_PRINT("  Triangle Setup: %6.3f ms\n", time_setup / 200.0);
-            SFT_PRINT("  Rasterization:  %6.3f ms\n", time_raster / 200.0);
-            SFT_PRINT("  Tile Output:    %6.3f ms\n", time_output / 200.0);
-            time_clear = time_setup = time_raster = time_output = 0.0;
-            frames = 0;
-        }
+        sft__resolve_tile(depth_buf, vid_buf, tile_min_x, tile_min_y);
     }
 }
 
@@ -3334,10 +3369,6 @@ static int sft__cmp_tile_loads(const void* a, const void* b) {
 }
 
 static void sft__worker_thread(void* user_data) {
-    static f64 accum_geom = 0.0;
-    static f64 accum_raster = 0.0;
-    static i32 frame_counter = 0;
-    
     while (1) {
         sft_sem_wait(&sft_state->sem_start);
 
@@ -3345,11 +3376,6 @@ static void sft__worker_thread(void* user_data) {
         
         // grab this thread's private slice of the pre allocated array
         struct sft_thread_bin_state* local_bins = &sft_state->thread_bin_states[sft_thread_id * total_tiles];
-
-        f64 t_start = 0.0, t_geom = 0.0, t_raster = 0.0;
-        if (0 == sft_thread_id) {
-            t_start = sft__get_ms();
-        }
 
         // reset all local bins for the new frame
         for (i32 i = 0; i < total_tiles; i += 1) {
@@ -3360,92 +3386,27 @@ static void sft__worker_thread(void* user_data) {
         }
 
         // ---  geometry and binning pass  ---
-        f64 work_start = sft__get_ms();
         sft__worker_phase_geom(local_bins);
-        dbg_geom_work[sft_thread_id] += (sft__get_ms() - work_start);
-        
-        f64 wait_start = sft__get_ms();
         sft__barrier_wait(&sft_state->geom_barrier);
-        dbg_geom_wait[sft_thread_id] += (sft__get_ms() - wait_start);
 
-        if (0 == sft_thread_id) {
-            t_geom = sft__get_ms();
-            
-            const f64 qsort_start = sft__get_ms();
+        if (0 == sft_thread_id) {            
             const i32 total_tiles = sft_state->display.tile_cols * sft_state->display.tile_rows;
             for (i32 i = 0; i < total_tiles; i += 1) {
                 sft_state->display.sorted_tiles[i] = i;
             }
             qsort(sft_state->display.sorted_tiles, total_tiles, sizeof(i32), sft__cmp_tile_loads);
-            dbg_qsort_time += (sft__get_ms() - qsort_start);
         }
 
         sft__barrier_wait(&sft_state->prefix_barrier);
 
         // ---  rasterization pass  ---
-        work_start = sft__get_ms();
         sft__worker_phase_rasterize();
-        dbg_rast_work[sft_thread_id] += (sft__get_ms() - work_start);
-        
-        wait_start = sft__get_ms();
         sft__barrier_wait(&sft_state->raster_barrier); 
-        dbg_rast_wait[sft_thread_id] += (sft__get_ms() - wait_start);
         
         // final synchronize and cleanup
         sft__barrier_wait(&sft_state->raster_barrier); 
         
-        if (0 == sft_thread_id) {
-            frame_counter += 1;
-            if (frame_counter >= 200) {
-                f64 max_g_work = 0, min_g_work = 99999;
-                f64 max_g_wait = 0, min_g_wait = 99999;
-                i32 max_jobs = 0, min_jobs = 99999;
-                
-                f64 max_r_work = 0, min_r_work = 99999;
-                f64 max_r_wait = 0, min_r_wait = 99999;
-                i32 max_tiles = 0, min_tiles = 99999;
-
-                for(i32 i = 0; i < sft_state->thread_count; i += 1) {
-                    f64 gw = dbg_geom_work[i] / 200.0;
-                    f64 g_wait = dbg_geom_wait[i] / 200.0;
-                    i32 jc = dbg_job_count[i] / 200;
-                    
-                    if (gw > max_g_work) max_g_work = gw;
-                    if (gw < min_g_work) min_g_work = gw;
-                    if (g_wait > max_g_wait) max_g_wait = g_wait;
-                    if (g_wait < min_g_wait) min_g_wait = g_wait;
-                    if (jc > max_jobs) max_jobs = jc;
-                    if (jc < min_jobs) min_jobs = jc;
-
-                    f64 rw = dbg_rast_work[i] / 200.0;
-                    f64 r_wait = dbg_rast_wait[i] / 200.0;
-                    i32 tc = dbg_tile_count[i] / 200;
-                    
-                    if (rw > max_r_work) max_r_work = rw;
-                    if (rw < min_r_work) min_r_work = rw;
-                    if (r_wait > max_r_wait) max_r_wait = r_wait;
-                    if (r_wait < min_r_wait) min_r_wait = r_wait;
-                    if (tc > max_tiles) max_tiles = tc;
-                    if (tc < min_tiles) min_tiles = tc;
-                }
-
-                SFT_PRINT("--- THREAD LOAD DISTRIBUTION (Avg over 200 frames) ---\n");
-                SFT_PRINT("GEOM   | Work: %5.2fms to %5.2fms | Wait: %5.2fms to %5.2fms | Jobs: %d to %d\n", min_g_work, max_g_work, min_g_wait, max_g_wait, min_jobs, max_jobs);
-                SFT_PRINT("SORT   | QSort overhead: %5.3fms\n", dbg_qsort_time / 200.0);
-                SFT_PRINT("RAST   | Work: %5.2fms to %5.2fms | Wait: %5.2fms to %5.2fms | Tiles: %d to %d\n\n", min_r_work, max_r_work, min_r_wait, max_r_wait, min_tiles, max_tiles);
-                
-                memset(dbg_geom_work, 0, sizeof(dbg_geom_work));
-                memset(dbg_geom_wait, 0, sizeof(dbg_geom_wait));
-                memset(dbg_job_count, 0, sizeof(dbg_job_count));
-                memset(dbg_rast_work, 0, sizeof(dbg_rast_work));
-                memset(dbg_rast_wait, 0, sizeof(dbg_rast_wait));
-                memset(dbg_tile_count, 0, sizeof(dbg_tile_count));
-                dbg_qsort_time = 0.0;
-                frame_counter = 0;
-            }
-        }
-
-        // TODO resolve phase
+        // TODO real resolve phase
 
         sft_sem_post(&sft_state->sem_done, 1);
     }
@@ -3776,46 +3737,68 @@ SFT_FUNC sft_model* sft_load_gltf(const char* filename, sft_arena* arena, i32 uv
     u32 meshlet_count = 0;
     struct sft_meshlet_builder builder;
 
+    i32 linear_search_head = 0; // cache to avoid O(N^2) searching
+
     while (unmapped_tris > 0) {
         sft__builder_reset(&builder);
         i32 frontier_head = 0;
         i32 frontier_tail = 0;
 
-        i32 seed_tri = -1;
-        for (i32 k = 0; k < total_tris; k += 1) {
-            if (!used_tris[k]) {
-                seed_tri = k;
-                break;
-            }
-        }
-        if (-1 == seed_tri) {
-            break;
-        }
-
-        const i32 v0 = uni_inds[seed_tri * 3 + 0];
-        const i32 v1 = uni_inds[seed_tri * 3 + 1];
-        const i32 v2 = uni_inds[seed_tri * 3 + 2];
-        const sftvec normal = sft_v_face_normal(SFT_V(uni_vx[v0], uni_vy[v0], uni_vz[v0]), 
-                                                SFT_V(uni_vx[v1], uni_vy[v1], uni_vz[v1]), 
-                                                SFT_V(uni_vx[v2], uni_vy[v2], uni_vz[v2]));
-
-        sft__builder_add_triangle(&builder, v0, v1, v2, normal);
-        used_tris[seed_tri] = 1;
-        unmapped_tris -= 1;
-
-        const i32 seed_verts[3] = {v0, v1, v2};
-        for (i32 v = 0; v < 3; v += 1) {
-            const i32 vert = seed_verts[v];
-            for (i32 adj_ind = vertex_offsets[vert]; adj_ind < vertex_offsets[vert + 1]; adj_ind += 1) {
-                const i32 adj_tri = adjacency[adj_ind];
-                if (!used_tris[adj_tri] && !in_frontier[adj_tri]) {
-                    frontier[frontier_tail++] = adj_tri;
-                    in_frontier[adj_tri] = 1;
+        // keep filling until vertex/tri limits are hit, or no more triangles
+        while (builder.vert_count < SFT_VERTS_PER_MESHLET && builder.tri_count < 128 && unmapped_tris > 0) {
+            
+            // ---  spatial jump  ---
+            // if the frontier is empty then hit a topological dead end (UV seam, separate leaf, etc.)
+            if (frontier_head == frontier_tail) {
+                i32 jump_seed = -1;
+                for (i32 k = linear_search_head; k < total_tris; k += 1) {
+                    if (!used_tris[k]) {
+                        jump_seed = k;
+                        linear_search_head = k;
+                        break;
+                    }
                 }
-            }
-        }
+                
+                if (-1 == jump_seed) {
+                    break; // entire model is mapped
+                }
 
-        while (builder.vert_count < SFT_VERTS_PER_MESHLET && builder.tri_count < 128 && frontier_head < frontier_tail) {
+                const i32 v0 = uni_inds[jump_seed * 3 + 0];
+                const i32 v1 = uni_inds[jump_seed * 3 + 1];
+                const i32 v2 = uni_inds[jump_seed * 3 + 2];
+                const sftvec normal = sft_v_face_normal(
+                    SFT_V(uni_vx[v0], uni_vy[v0], uni_vz[v0]), 
+                    SFT_V(uni_vx[v1], uni_vy[v1], uni_vz[v1]), 
+                    SFT_V(uni_vx[v2], uni_vy[v2], uni_vz[v2]));
+
+                // ensure the jump seed doesn't violate limits of the current meshlet
+                if (builder.tri_count > 0) {
+                    if (sft__builder_score_candidate(&builder, v0, v1, v2, normal) < 0.f) {
+                        // it doesn't fit (cone divergence usually), break and let it start the next meshlet
+                        break; 
+                    }
+                }
+
+                sft__builder_add_triangle(&builder, v0, v1, v2, normal);
+                used_tris[jump_seed] = 1;
+                unmapped_tris -= 1;
+
+                // push its topological neighbors to the newly revived frontier
+                const i32 new_verts[3] = {v0, v1, v2};
+                for (i32 v = 0; v < 3; v += 1) {
+                    const i32 vert = new_verts[v];
+                    for (i32 adj_ind = vertex_offsets[vert]; adj_ind < vertex_offsets[vert + 1]; adj_ind += 1) {
+                        const i32 adj_tri = adjacency[adj_ind];
+                        if (!used_tris[adj_tri] && !in_frontier[adj_tri]) {
+                            frontier[frontier_tail++] = adj_tri;
+                            in_frontier[adj_tri] = 1;
+                        }
+                    }
+                }
+                continue; // skip the frontier popping below, just populated it
+            }
+
+            // ---  normal frontier processing  ---
             f32 best_score = -1.f;
             i32 best_tri_ind = -1;
             sftvec best_normal = {0};
@@ -3829,9 +3812,10 @@ SFT_FUNC sft_model* sft_load_gltf(const char* filename, sft_arena* arena, i32 uv
                 const i32 cv0 = uni_inds[candidate_tri * 3 + 0];
                 const i32 cv1 = uni_inds[candidate_tri * 3 + 1];
                 const i32 cv2 = uni_inds[candidate_tri * 3 + 2];
-                const sftvec c_normal = sft_v_face_normal(SFT_V(uni_vx[cv0], uni_vy[cv0], uni_vz[cv0]), 
-                                                          SFT_V(uni_vx[cv1], uni_vy[cv1], uni_vz[cv1]), 
-                                                          SFT_V(uni_vx[cv2], uni_vy[cv2], uni_vz[cv2]));
+                const sftvec c_normal = sft_v_face_normal(
+                    SFT_V(uni_vx[cv0], uni_vy[cv0], uni_vz[cv0]), 
+                    SFT_V(uni_vx[cv1], uni_vy[cv1], uni_vz[cv1]), 
+                    SFT_V(uni_vx[cv2], uni_vy[cv2], uni_vz[cv2]));
 
                 const f32 score = sft__builder_score_candidate(&builder, cv0, cv1, cv2, c_normal);
                 if (score > best_score) {
@@ -3842,7 +3826,10 @@ SFT_FUNC sft_model* sft_load_gltf(const char* filename, sft_arena* arena, i32 uv
             }
 
             if (-1 == best_tri_ind) {
-                break;
+                // the frontier has triangles, but all of them scored -1 (e.g., cone limit violated),
+                // don't break, clear the frontier to force a spatial jump on the next iteration
+                frontier_head = frontier_tail = 0;
+                continue;
             }
 
             const i32 best_tri = frontier[best_tri_ind];
