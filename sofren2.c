@@ -75,6 +75,9 @@ typedef struct sft_texture  sft_texture;
 typedef struct sft_material sft_material;
 typedef struct sft_instance sft_instance;
 
+typedef struct sft_directional_light sft_directional_light;
+typedef struct sft_point_light       sft_point_light;
+
 typedef u32 sft_tex_handle;
 typedef u32 sft_mat_handle;
 
@@ -141,7 +144,7 @@ typedef u32 sft_mat_handle;
 
 #define SFT_CHUNK_CAPACITY 63
 
-#define SFT_TILE_SHIFT 5
+#define SFT_TILE_SHIFT 6
 #define SFT_TILE_SIZE (1 << SFT_TILE_SHIFT)
 
 #if defined(_WIN32)
@@ -240,6 +243,7 @@ typedef u32 sft_mat_handle;
     #define sft_vf_fnmadd(a, b, c)      _mm256_fnmadd_ps((a), (b), (c))
     #define sft_vf_fmsub(a, b, c)       _mm256_fmsub_ps((a), (b), (c))
     #define sft_vf_sqrt(a)              _mm256_sqrt_ps(a)
+    #define sft_vf_rsqrt(a)             _mm256_rsqrt_ps(a)
     #define sft_vf_floor(v)             _mm256_floor_ps(v)
 
     // ---  vf32 bitwise and logic  ---
@@ -370,6 +374,7 @@ typedef u32 sft_mat_handle;
     #define sft_vf_fnmadd(a, b, c)      vmlsq_f32((c), (a), (b))
     #define sft_vf_fmsub(a, b, c)       vfmsq_f32((c), (a), (b))
     #define sft_vf_sqrt(a)              vsqrtq_f32(a)
+    #define sft_vf_rsqrt(a)             vrsqrteq_f32(a)
     #define sft_vf_floor(v)             vrndmq_f32(v)
 
     // ---  vf32 bitwise and logic  ---
@@ -494,6 +499,7 @@ typedef u32 sft_mat_handle;
     #define sft_vf_fnmadd(a, b, c)      (-((a) * (b)) + (c))
     #define sft_vf_fmsub(a, b, c)       ((a) * (b) - (c))
     #define sft_vf_sqrt(a)              sqrtf(a)
+    #define sft_vf_rsqrt(a)             (1.f / sqrtf(a))
     #define sft_vf_floor(v)             floorf(v)
 
     // ---  vf32 bitwise and logic  ---
@@ -717,21 +723,28 @@ SFT_INLINE sftvvec sft_vv_cross(sftvvec a, sftvvec b);
 SFT_INLINE vf32 sft_vv_length2(sftvvec v);
 SFT_INLINE vf32 sft_vv_length(sftvvec v);
 SFT_INLINE sftvvec sft_vv_norm(sftvvec v);
+SFT_INLINE sftvvec sft_vv_norm_fast(sftvvec v);
 SFT_INLINE sftvvec sft_vv_transform(sftvvec v, sftvmat vm);
 SFT_INLINE sftvvec sft_vv_transform_dir(sftvvec v, sftvmat vm);
 SFT_INLINE sftvmat sft_vm_broadcast(sftmat m);
 
 // core functions
-SFT_FUNC void sft_init(i32 width, i32 height, i32 requested_threads); // requested_threads == 0 => use physical core count
+SFT_FUNC void sft_init(i32 width, i32 height, i32 requested_threads); // 0 == requested_threads => use physical core count
 SFT_FUNC void sft_release(void);
 SFT_FUNC void sft_present(void);
 SFT_FUNC void sft_frame_begin(void);
 SFT_FUNC void sft_frame_end(void);
 
+// misc
 SFT_FUNC void sft_set_camera(sftvec cam_pos, sftmat view, sftmat proj);
 
 // drawing functions
 SFT_FUNC void sft_draw_instance(const sft_instance* instance);
+
+// light functions
+SFT_FUNC void sft_set_ambient_light(f32 r, f32 g, f32 b);
+SFT_FUNC void sft_draw_directional_light(sftvec dir, f32 r, f32 g, f32 b, f32 intensity);
+SFT_FUNC void sft_draw_point_light(sftvec pos, f32 r, f32 g, f32 b, f32 intensity, f32 radius);
 
 // texture functions
 #ifdef SFT_USE_STB_IMAGE
@@ -887,6 +900,18 @@ typedef struct sft_instance {
     u32 ss_meshlet_offset;  // cache tracking
 } sft_instance;
 
+typedef struct sft_directional_light {
+    sftvec dir;   // must be normalized
+    sftvec color; // RGB [0.0, 1.0], pre multiplied by intensity
+} sft_directional_light;
+
+typedef struct sft_point_light {
+    sftvec pos;
+    sftvec color;       // RGB [0.0, 1.0], pre multiplied by intensity
+    f32 radius;         // used for tile frustum culling
+    f32 inv_radius_sqr; // 1.f / (radius * radius), for attenuation
+} sft_point_light;
+
 struct sft_atomic_counter {
     alignas(64) volatile i32 count;
 };
@@ -942,11 +967,11 @@ struct sft_geom_job {
 };
 
 struct sft_clipped_triangle {
-    f32 sx[3];
-    f32 sy[3];
+    f32 sx[3], sy[3];
     f32 inv_w[3];
-    f32 u[3];
-    f32 v[3];
+    f32 u[3], v[3];
+    f32 px[3], py[3], pz[3];
+    f32 nx[3], ny[3], nz[3];
     u32 inst_ind;
     u32 m_ind;
 };
@@ -954,6 +979,8 @@ struct sft_clipped_triangle {
 struct sft_clip_vert {
     f32 tx, ty, tz, w;
     f32 u, v;
+    f32 px, py, pz;
+    f32 nx, ny, nz;
 };
 
 struct sft_sphere {
@@ -988,15 +1015,16 @@ static struct sft_state {
     sft_arena scratch_arena;
     sft_arena clip_arena;
     sft_arena tex_heap_arena;
+    sft_arena light_arena;
 
     struct {
         // pointers to virtual reservations
         sft_instance* instances;
         struct sft_geom_job* jobs;
         
-        volatile i32 instance_count;
-        volatile i32 job_count;
-        volatile i32 total_ss_meshlets; // allocated screen space meshlets
+        struct sft_atomic_counter instance_count;
+        struct sft_atomic_counter job_count;
+        struct sft_atomic_counter total_ss_meshlets; // allocated screen space meshlets
     } cmd_queue;
 
     struct sft_atomic_counter next_job_ind;
@@ -1054,6 +1082,14 @@ static struct sft_state {
         i32 count;
         i32 capacity;
     } mat_pool_transient;
+
+    sftvec ambient_light;
+    struct {
+        sft_directional_light* directional;
+        sft_point_light* point;
+        struct sft_atomic_counter directional_count;
+        struct sft_atomic_counter point_count;
+    } lighting;
 
     struct sft_frustum frustum;
     
@@ -1548,7 +1584,7 @@ SFT_INLINE vf32 sft_vv_length(sftvvec v) {
 }
 SFT_INLINE sftvvec sft_vv_norm(sftvvec v) {
     // avoid division by zero
-    const vf32 epsilon = sft_vf_set1(0.000001f);
+    const vf32 epsilon = sft_vf_set1(SFT_EPSILON);
     vf32 len = sft_vv_length(v);
     len = sft_vf_max(len, epsilon); 
     
@@ -1556,6 +1592,26 @@ SFT_INLINE sftvvec sft_vv_norm(sftvvec v) {
     r.x = sft_vf_div(v.x, len);
     r.y = sft_vf_div(v.y, len);
     r.z = sft_vf_div(v.z, len);
+    return r;
+}
+SFT_INLINE sftvvec sft_vv_norm_fast(sftvvec v) {
+    const vf32 sq_len = sft_vv_dot(v, v);
+    
+    const vf32 approx = sft_vf_rsqrt(sq_len);
+    
+    // one iteration
+    const vf32 half = sft_vf_set1(0.5f);
+    const vf32 three = sft_vf_set1(3.f);
+    const vf32 approx_sq = sft_vf_mul(approx, approx);
+    
+    // computes -(sq_len * approx_sq) + 3.0
+    const vf32 refined = sft_vf_mul(sft_vf_mul(half, approx), 
+                                    sft_vf_fnmadd(sq_len, approx_sq, three));
+    
+    sftvvec r;
+    r.x = sft_vf_mul(v.x, refined);
+    r.y = sft_vf_mul(v.y, refined);
+    r.z = sft_vf_mul(v.z, refined);
     return r;
 }
 SFT_INLINE sftvvec sft_vv_transform(sftvvec v, sftvmat vm) {
@@ -2362,6 +2418,12 @@ static SFT_INLINE struct sft_clip_vert sft__lerp_clip_vert(struct sft_clip_vert 
         .w  = SFT_LERPF(a.w,  b.w,  t),
         .u  = SFT_LERPF(a.u,  b.u,  t),
         .v  = SFT_LERPF(a.v,  b.v,  t),
+        .px = SFT_LERPF(a.px, b.px, t),
+        .py = SFT_LERPF(a.py, b.py, t),
+        .pz = SFT_LERPF(a.pz, b.pz, t),
+        .nx = SFT_LERPF(a.nx, b.nx, t),
+        .ny = SFT_LERPF(a.ny, b.ny, t),
+        .nz = SFT_LERPF(a.nz, b.nz, t)
     };
 }
 
@@ -2812,16 +2874,23 @@ static SFT_INLINE void sft__geom_clip_and_bin(
         const sft_mesh* mesh = &inst->model->meshes[mesh_ind];
         const u32 local_m_ind = m_ind - mesh->model_meshlet_offset;
         const struct sft_meshlet_attribs* m_attribs = &mesh->meshlet_attribs[local_m_ind];
+        const struct sft_meshlet* m_verts = &mesh->meshlets[local_m_ind];
 
         const struct sft_clip_vert in_tri[3] = { {
             .tx = clip_tx[i0], .ty = clip_ty[i0], .tz = clip_tz[i0], .w = clip_w[i0],
-            .u = m_attribs->u[i0], .v = m_attribs->v[i0]
+            .u = m_attribs->u[i0], .v = m_attribs->v[i0],
+            .px = m_verts->x[i0], .py = m_verts->y[i0], .pz = m_verts->z[i0],
+            .nx = m_attribs->nx[i0], .ny = m_attribs->ny[i0], .nz = m_attribs->nz[i0]
         }, {
             .tx = clip_tx[i1], .ty = clip_ty[i1], .tz = clip_tz[i1], .w = clip_w[i1],
-            .u = m_attribs->u[i1], .v = m_attribs->v[i1]
+            .u = m_attribs->u[i1], .v = m_attribs->v[i1],
+            .px = m_verts->x[i1], .py = m_verts->y[i1], .pz = m_verts->z[i1],
+            .nx = m_attribs->nx[i1], .ny = m_attribs->ny[i1], .nz = m_attribs->nz[i1]
         }, {
             .tx = clip_tx[i2], .ty = clip_ty[i2], .tz = clip_tz[i2], .w = clip_w[i2],
-            .u = m_attribs->u[i2], .v = m_attribs->v[i2]
+            .u = m_attribs->u[i2], .v = m_attribs->v[i2],
+            .px = m_verts->x[i2], .py = m_verts->y[i2], .pz = m_verts->z[i2],
+            .nx = m_attribs->nx[i2], .ny = m_attribs->ny[i2], .nz = m_attribs->nz[i2]
         } };
 
         struct sft_clip_vert out_tris[2][3];
@@ -2837,6 +2906,12 @@ static SFT_INLINE void sft__geom_clip_and_bin(
             for (i32 v = 0; v < 3; v += 1) {
                 ct->u[v] = out_tris[c][v].u;
                 ct->v[v] = out_tris[c][v].v;
+                ct->px[v] = out_tris[c][v].px;
+                ct->py[v] = out_tris[c][v].py;
+                ct->pz[v] = out_tris[c][v].pz;
+                ct->nx[v] = out_tris[c][v].nx;
+                ct->ny[v] = out_tris[c][v].ny;
+                ct->nz[v] = out_tris[c][v].nz;
             }
 
             const f32 area = (ct->sx[1] - ct->sx[0]) * (ct->sy[2] - ct->sy[0]) - (ct->sy[1] - ct->sy[0]) * (ct->sx[2] - ct->sx[0]);
@@ -2984,7 +3059,7 @@ static SFT_INLINE void sft__worker_phase_geom(struct sft_thread_bin_state* local
 
     while (1) {
         const i32 job_ind = sft_atomic_add(&sft_state->next_job_ind.count, 1);
-        if (job_ind >= sft_state->cmd_queue.job_count) {
+        if (job_ind >= sft_state->cmd_queue.job_count.count) {
             break;
         }
 
@@ -3151,9 +3226,9 @@ static SFT_INLINE void sft__rast_simd_batch(
         clip_slot = (u32)(payload & 0xFFFFFFFF);
         const struct sft_clipped_triangle* ct = &sft_state->clip_cache.pool[clip_slot];
 
-        sx0 = sft_vf_set1(ct->sx[0]); sy0 = sft_vf_set1(ct->sy[0]); inv_w0 = sft_vf_set1(ct->inv_w[0]);
-        sx1 = sft_vf_set1(ct->sx[1]); sy1 = sft_vf_set1(ct->sy[1]); inv_w1 = sft_vf_set1(ct->inv_w[1]);
-        sx2 = sft_vf_set1(ct->sx[2]); sy2 = sft_vf_set1(ct->sy[2]); inv_w2 = sft_vf_set1(ct->inv_w[2]);
+        sx0 = sft_vf_set1(ct->sx[0]), sy0 = sft_vf_set1(ct->sy[0]), inv_w0 = sft_vf_set1(ct->inv_w[0]);
+        sx1 = sft_vf_set1(ct->sx[1]), sy1 = sft_vf_set1(ct->sy[1]), inv_w1 = sft_vf_set1(ct->inv_w[1]);
+        sx2 = sft_vf_set1(ct->sx[2]), sy2 = sft_vf_set1(ct->sy[2]), inv_w2 = sft_vf_set1(ct->inv_w[2]);
         
         active_tris = 1; // lane 0 only
     } 
@@ -3193,9 +3268,22 @@ static SFT_INLINE void sft__rast_simd_batch(
         inv_w2 = sft_vf_gather(sft_state->ss_cache[ss_m_ind].inv_w, v_i2);
     }
 
-    const vf32 A0 = sft_vf_sub(sy0, sy1), B0 = sft_vf_sub(sx1, sx0), C0 = sft_vf_sub(sft_vf_mul(sx0, sy1), sft_vf_mul(sy0, sx1));
-    const vf32 A1 = sft_vf_sub(sy1, sy2), B1 = sft_vf_sub(sx2, sx1), C1 = sft_vf_sub(sft_vf_mul(sx1, sy2), sft_vf_mul(sy1, sx2));
-    const vf32 A2 = sft_vf_sub(sy2, sy0), B2 = sft_vf_sub(sx0, sx2), C2 = sft_vf_sub(sft_vf_mul(sx2, sy0), sft_vf_mul(sy2, sx0));
+    const vf32 A0 = sft_vf_sub(sy0, sy1), B0 = sft_vf_sub(sx1, sx0);
+    const vf32 A1 = sft_vf_sub(sy1, sy2), B1 = sft_vf_sub(sx2, sx1);
+    const vf32 A2 = sft_vf_sub(sy2, sy0), B2 = sft_vf_sub(sx0, sx2);
+
+    // symmetric C0 for tight edges with aggressive FMA
+    const vf32 m01 = sft_vf_mul(sx0, sy1), m10 = sft_vf_mul(sy0, sx1);
+    const vf32 C0 = sft_vf_mul(
+        sft_vf_sub(sft_vf_fmsub(sx0, sy1, m10), sft_vf_fmsub(sy0, sx1, m01)), sft_vf_set1(0.5f));
+
+    const vf32 m12 = sft_vf_mul(sx1, sy2), m21 = sft_vf_mul(sy1, sx2);
+    const vf32 C1 = sft_vf_mul(
+        sft_vf_sub(sft_vf_fmsub(sx1, sy2, m21), sft_vf_fmsub(sy1, sx2, m12)), sft_vf_set1(0.5f));
+
+    const vf32 m20 = sft_vf_mul(sx2, sy0), m02 = sft_vf_mul(sy2, sx0);
+    const vf32 C2 = sft_vf_mul(
+        sft_vf_sub(sft_vf_fmsub(sx2, sy0, m02), sft_vf_fmsub(sy2, sx0, m20)), sft_vf_set1(0.5f));
 
     const vf32 dx1 = sft_vf_sub(sx1, sx0), dx2 = sft_vf_sub(sx2, sx0);
     const vf32 dy1 = sft_vf_sub(sy1, sy0), dy2 = sft_vf_sub(sy2, sy0);
@@ -3384,17 +3472,13 @@ static SFT_INLINE void sft__rast_simd_batch(
     }
 }
 
-static SFT_INLINE void sft__sample_tex_bilinear(
+static SFT_INLINE i32 sft__calculate_lod(
     sft_tex_handle tex_handle,
-    vf32 cu, vf32 cv, vf32 ddx_u, vf32 ddy_u, vf32 ddx_v, vf32 ddy_v,
-    vi32 v_tri_lanes, i32 block_x, i32 block_y,
-    vf32* out_r, vf32* out_g, vf32* out_b
+    vf32 ddx_u, vf32 ddy_u, vf32 ddx_v, vf32 ddy_v,
+    vi32 v_tri_lanes, i32 block_x, i32 block_y
 ) {
     if (SFT_INVALID_HANDLE == tex_handle) {
-        *out_r = sft_vf_set1(1.f);
-        *out_g = sft_vf_set1(1.f);
-        *out_b = sft_vf_set1(1.f);
-        return;
+        return 0;
     }
 
     const u32 t_ind = SFT_HANDLE_INDEX(tex_handle);
@@ -3415,7 +3499,7 @@ static SFT_INLINE void sft__sample_tex_bilinear(
     const f32 rho_max = SFT_MAX(SFT_MAX(fabsf(ux), fabsf(vx)), SFT_MAX(fabsf(uy), fabsf(vy)));
     
     i32 lod = 0;
-    if (rho_max > 1.0f) {
+    if (rho_max > 1.f) {
         // + ~20 FPS in Sponza vs using log2f
         const f32 lod_f = sft__fast_log2(rho_max); 
         
@@ -3426,7 +3510,25 @@ static SFT_INLINE void sft__sample_tex_bilinear(
         // add dither and round to nearest int mip level
         lod = (i32)(lod_f + 0.5f + bayer[b_ind]);
     }
-    lod = SFT_CLAMP(lod, 0, sft_state->tex_pool.mip_levels[t_ind] - 1);
+
+    return SFT_CLAMP(lod, 0, sft_state->tex_pool.mip_levels[t_ind] - 1);
+}
+
+static SFT_INLINE void sft__sample_tex_bilinear(
+    sft_tex_handle tex_handle, i32 lod,
+    vf32 cu, vf32 cv,
+    vf32* out_r, vf32* out_g, vf32* out_b
+) {
+    if (SFT_INVALID_HANDLE == tex_handle) {
+        *out_r = sft_vf_set1(1.f);
+        *out_g = sft_vf_set1(1.f);
+        *out_b = sft_vf_set1(1.f);
+        return;
+    }
+
+    const u32 t_ind = SFT_HANDLE_INDEX(tex_handle);
+    const i32 tex_w = sft_state->tex_pool.w[t_ind];
+    const i32 tex_h = sft_state->tex_pool.h[t_ind];
 
     // ---  setup mipmap data  ---
     const i32 mip_ind = t_ind * 14 + lod;
@@ -3531,6 +3633,75 @@ static SFT_INLINE void sft__sample_tex_bilinear(
     *out_b = out_0;
 }
 
+static SFT_INLINE void sft__sample_tex_nearest(
+    sft_tex_handle tex_handle, i32 lod,
+    vf32 cu, vf32 cv,
+    vf32* out_r, vf32* out_g, vf32* out_b
+) {
+    if (SFT_INVALID_HANDLE == tex_handle) {
+        *out_r = sft_vf_set1(1.f);
+        *out_g = sft_vf_set1(1.f);
+        *out_b = sft_vf_set1(1.f);
+        return;
+    }
+
+    const u32 t_ind = SFT_HANDLE_INDEX(tex_handle);
+    const i32 mip_ind = t_ind * 14 + lod;
+    const u32 mip_offset = sft_state->tex_pool.mip_offsets[mip_ind];
+    const u32* mip_pixels = (const u32*)(sft_state->tex_heap_arena.base + mip_offset);
+    
+    const i32 curr_w = SFT_MAX(sft_state->tex_pool.w[t_ind] >> lod, 1);
+    const i32 curr_h = SFT_MAX(sft_state->tex_pool.h[t_ind] >> lod, 1);
+
+    // scale UV directly to pixel coords
+    const vf32 u_px = sft_vf_mul(cu, sft_vf_set1((f32)curr_w));
+    const vf32 v_px = sft_vf_mul(cv, sft_vf_set1((f32)curr_h));
+
+    // floor before truncating to properly handle negative wrapped UVs
+    const vi32 u0 = sft_vi_cvttps_epi32(sft_vf_floor(u_px));
+    const vi32 v0 = sft_vi_cvttps_epi32(sft_vf_floor(v_px));
+    
+    const u8 is_pot = sft_state->tex_pool.is_pot[t_ind];
+    const vi32 w_max = sft_vi_set1(curr_w - 1);
+    const vi32 h_max = sft_vi_set1(curr_h - 1);
+    
+    vi32 u0_wrap, v0_wrap;
+    if (is_pot) {
+        u0_wrap = sft_vi_and(u0, w_max);
+        v0_wrap = sft_vi_and(v0, h_max);
+    }
+    else {
+        u0_wrap = sft_vi_min(u0, w_max);
+        v0_wrap = sft_vi_min(v0, h_max);
+    }
+
+    // address calculation
+    vi32 addr_00;
+    if (is_pot) {
+        const i32 stride_shift = sft_state->tex_pool.mip_stride_shift[mip_ind];
+        addr_00 = sft_vi_add(
+            sft_vi_slli(sft_vi_add(sft_vi_slli(sft_vi_srli(v0_wrap, 2), stride_shift), sft_vi_srli(u0_wrap, 2)), 4),
+            sft_vi_add(sft_vi_slli(sft_vi_and(v0_wrap, sft_vi_set1(3)), 2), sft_vi_and(u0_wrap, sft_vi_set1(3)))
+        );
+    }
+    else {
+        const vi32 bw = sft_vi_set1(sft_state->tex_pool.mip_blocks_w[mip_ind]);
+        addr_00 = sft_vi_add(
+            sft_vi_slli(sft_vi_add(sft_vi_mullo(sft_vi_srli(v0_wrap, 2), bw), sft_vi_srli(u0_wrap, 2)), 4),
+            sft_vi_add(sft_vi_slli(sft_vi_and(v0_wrap, sft_vi_set1(3)), 2), sft_vi_and(u0_wrap, sft_vi_set1(3)))
+        );
+    }
+
+    // one texel per lane
+    const vi32 c00 = sft_vi_gather((const int*)mip_pixels, addr_00);
+    const vf32 i255 = sft_vf_set1(1.f / 255.f);
+    const vi32 mask_8 = sft_vi_set1(0xFF);
+
+    *out_r = sft_vf_mul(sft_vf_cvtepi32(sft_vi_and(sft_vi_srli(c00, 16), mask_8)), i255);
+    *out_g = sft_vf_mul(sft_vf_cvtepi32(sft_vi_and(sft_vi_srli(c00, 8), mask_8)), i255);
+    *out_b = sft_vf_mul(sft_vf_cvtepi32(sft_vi_and(c00, mask_8)), i255);
+}
+
 static SFT_INLINE void sft__resolve_tile(
     const f32* depth_buf, const u32* vid_buf,
     i32 tile_min_x, i32 tile_min_y
@@ -3540,6 +3711,101 @@ static SFT_INLINE void sft__resolve_tile(
 
     const i32 limit_x = SFT_MIN(tile_min_x + SFT_TILE_SIZE, screen_w);
     const i32 limit_y = SFT_MIN(tile_min_y + SFT_TILE_SIZE, screen_h);
+
+    vf32 v_tile_min = sft_vf_set1(1e9f);
+    vf32 v_tile_max = sft_vf_set1(-1e9f);
+    const vf32 v_depth_threshold = sft_vf_set1(0.0001f);
+    
+    // SFT_TILE_SIZE^2 pixels in SFT_SIMD_WIDTH steps
+    for (i32 i = 0; i < SFT_TILE_SIZE * SFT_TILE_SIZE; i += SFT_SIMD_WIDTH) {
+        const vf32 d = sft_vf_load(&depth_buf[i]);
+        
+        // mask out the empty background pixels (where depth is 0.0)
+        const vf32 valid_mask = sft_vf_cmp_gt(d, v_depth_threshold);
+        
+        if (sft_vf_movemask(valid_mask)) {
+            // blend in extreme values for invalid lanes so they don't corrupt the min/max
+            const vf32 safe_d_min = sft_vf_blendv(d, sft_vf_set1(1e9f), valid_mask);
+            const vf32 safe_d_max = sft_vf_blendv(d, sft_vf_set1(-1e9f), valid_mask);
+            
+            v_tile_min = sft_vf_min(v_tile_min, safe_d_min);
+            v_tile_max = sft_vf_max(v_tile_max, safe_d_max);
+        }
+    }
+
+    // collapse the registers into scalar values
+    f32 tile_min_z = 1e9f;
+    f32 tile_max_z = -1e9f;
+    
+    alignas(32) f32 s_min[SFT_SIMD_WIDTH];
+    alignas(32) f32 s_max[SFT_SIMD_WIDTH];
+    sft_vf_store(s_min, v_tile_min);
+    sft_vf_store(s_max, v_tile_max);
+    
+    for (i32 i = 0; i < SFT_SIMD_WIDTH; i += 1) {
+        if (s_min[i] < tile_min_z) tile_min_z = s_min[i];
+        if (s_max[i] > tile_max_z) tile_max_z = s_max[i];
+    }
+    
+    // ---  tile light culling  ---
+    const i32 total_point_lights = sft_state->lighting.point_count.count;
+    u16 tile_lights[16]; // TODO remove arbitrary max
+    i32 tile_light_count = 0;
+
+    if (tile_min_z <= tile_max_z && total_point_lights > 0) {
+        const sftmat* vp = &sft_state->view_proj;
+        const f32 hw = sft_state->display.half_width;
+        const f32 hh = sft_state->display.half_height;
+        const f32 vpx = sft_state->display.vp_x;
+        const f32 vpy = sft_state->display.vp_y;
+
+        for (i32 l = 0; l < total_point_lights; l += 1) {
+            const sftvec pos = sft_state->lighting.point[l].pos;
+            const f32 radius = sft_state->lighting.point[l].radius * 100.f;
+            // TODO remove the "* 100.f" hack                      ^^^^^^^
+
+            const f32 w = pos.x * vp->m[0][3] + pos.y * vp->m[1][3] + pos.z * vp->m[2][3] + vp->m[3][3];
+            
+            // Z cull
+            if ((w + radius) < tile_min_z || (w - radius) > tile_max_z) {
+                continue; 
+            }
+
+            // screen space 2D bounds check
+            if (w > radius) { 
+                const f32 tx = pos.x * vp->m[0][0] + pos.y * vp->m[1][0] + pos.z * vp->m[2][0] + vp->m[3][0];
+                const f32 ty = pos.x * vp->m[0][1] + pos.y * vp->m[1][1] + pos.z * vp->m[2][1] + vp->m[3][1];
+                
+                const f32 sx = (tx / w + 1.f) * hw + vpx;
+                const f32 sy = (-ty / w + 1.f) * hh + vpy;
+
+                const f32 safe_w = SFT_MAX(w - radius, 0.001f);
+                const f32 rx_screen = fabsf((radius * vp->m[0][0]) / safe_w * hw);
+                const f32 ry_screen = fabsf((radius * vp->m[1][1]) / safe_w * hh);
+
+                const f32 l_min_x = sx - rx_screen;
+                const f32 l_max_x = sx + rx_screen;
+                const f32 l_min_y = sy - ry_screen;
+                const f32 l_max_y = sy + ry_screen;
+
+                const f32 t_min_x = (f32)tile_min_x;
+                const f32 t_max_x = (f32)(tile_min_x + SFT_TILE_SIZE);
+                const f32 t_min_y = (f32)tile_min_y;
+                const f32 t_max_y = (f32)(tile_min_y + SFT_TILE_SIZE);
+
+                if (l_max_x < t_min_x || l_min_x > t_max_x || l_max_y < t_min_y || l_min_y > t_max_y) {
+                    continue;
+                }
+            }
+
+            tile_lights[tile_light_count] = (u16)l;
+            tile_light_count += 1;
+
+            if (SFT_ARRLEN(tile_lights) == tile_light_count) {
+                break;
+            }
+        }
+    }
 
     const vf32 v_zero = sft_vf_setzero();
     const vf32 v_one = sft_vf_set1(1.f);
@@ -3631,6 +3897,9 @@ static SFT_INLINE void sft__resolve_tile(
                 vf32 sx0, sy0, inv_w0, u0, v0;
                 vf32 sx1, sy1, inv_w1, u1, v1;
                 vf32 sx2, sy2, inv_w2, u2, v2;
+                vf32 px0, py0, pz0, nx0, ny0, nz0;
+                vf32 px1, py1, pz1, nx1, ny1, nz1;
+                vf32 px2, py2, pz2, nx2, ny2, nz2;
 
                 const u32 is_clipped = target_vid & (1U << 31);
                 
@@ -3643,12 +3912,18 @@ static SFT_INLINE void sft__resolve_tile(
                     
                     sx0 = sft_vf_set1(ct->sx[0]), sy0 = sft_vf_set1(ct->sy[0]), inv_w0 = sft_vf_set1(ct->inv_w[0]);
                     u0 = sft_vf_set1(ct->u[0]), v0 = sft_vf_set1(ct->v[0]);
+                    px0 = sft_vf_set1(ct->px[0]), py0 = sft_vf_set1(ct->py[0]), pz0 = sft_vf_set1(ct->pz[0]);
+                    nx0 = sft_vf_set1(ct->nx[0]), ny0 = sft_vf_set1(ct->ny[0]), nz0 = sft_vf_set1(ct->nz[0]);
                     
                     sx1 = sft_vf_set1(ct->sx[1]), sy1 = sft_vf_set1(ct->sy[1]), inv_w1 = sft_vf_set1(ct->inv_w[1]);
                     u1 = sft_vf_set1(ct->u[1]), v1 = sft_vf_set1(ct->v[1]);
+                    px1 = sft_vf_set1(ct->px[1]), py1 = sft_vf_set1(ct->py[1]), pz1 = sft_vf_set1(ct->pz[1]);
+                    nx1 = sft_vf_set1(ct->nx[1]), ny1 = sft_vf_set1(ct->ny[1]), nz1 = sft_vf_set1(ct->nz[1]);
                     
                     sx2 = sft_vf_set1(ct->sx[2]), sy2 = sft_vf_set1(ct->sy[2]), inv_w2 = sft_vf_set1(ct->inv_w[2]);
                     u2 = sft_vf_set1(ct->u[2]), v2 = sft_vf_set1(ct->v[2]);
+                    px2 = sft_vf_set1(ct->px[2]), py2 = sft_vf_set1(ct->py[2]), pz2 = sft_vf_set1(ct->pz[2]);
+                    nx2 = sft_vf_set1(ct->nx[2]), ny2 = sft_vf_set1(ct->ny[2]), nz2 = sft_vf_set1(ct->nz[2]);
                 }
                 else {
                     inst_ind  = (target_vid >> (SFT_TRIANGLE_BITS + SFT_MESHLET_BITS)) & ((1 << SFT_INSTANCE_BITS) - 1);
@@ -3663,6 +3938,7 @@ static SFT_INLINE void sft__resolve_tile(
 
                     const struct sft_meshlet_inds* m_inds = &mesh->inds[local_m_ind];
                     const struct sft_meshlet_attribs* m_attribs = &mesh->meshlet_attribs[local_m_ind];
+                    const struct sft_meshlet* m_verts = &mesh->meshlets[local_m_ind];
                     const u32 ss_m_ind = inst->ss_meshlet_offset + m_ind;
 
                     const u32 batch = local_tri / SFT_SIMD_WIDTH;
@@ -3676,20 +3952,40 @@ static SFT_INLINE void sft__resolve_tile(
                     sx0 = sft_vf_set1(sft_state->ss_cache[ss_m_ind].sx[i0]);
                     sy0 = sft_vf_set1(sft_state->ss_cache[ss_m_ind].sy[i0]);
                     inv_w0 = sft_vf_set1(sft_state->ss_cache[ss_m_ind].inv_w[i0]);
-                    u0 = sft_vf_set1(m_attribs->u[i0]); v0 = sft_vf_set1(m_attribs->v[i0]);
+                    u0 = sft_vf_set1(m_attribs->u[i0]), v0 = sft_vf_set1(m_attribs->v[i0]);
                     
                     sx1 = sft_vf_set1(sft_state->ss_cache[ss_m_ind].sx[i1]);
                     sy1 = sft_vf_set1(sft_state->ss_cache[ss_m_ind].sy[i1]);
                     inv_w1 = sft_vf_set1(sft_state->ss_cache[ss_m_ind].inv_w[i1]);
-                    u1 = sft_vf_set1(m_attribs->u[i1]); v1 = sft_vf_set1(m_attribs->v[i1]);
+                    u1 = sft_vf_set1(m_attribs->u[i1]), v1 = sft_vf_set1(m_attribs->v[i1]);
                     
                     sx2 = sft_vf_set1(sft_state->ss_cache[ss_m_ind].sx[i2]);
                     sy2 = sft_vf_set1(sft_state->ss_cache[ss_m_ind].sy[i2]);
                     inv_w2 = sft_vf_set1(sft_state->ss_cache[ss_m_ind].inv_w[i2]);
-                    u2 = sft_vf_set1(m_attribs->u[i2]); v2 = sft_vf_set1(m_attribs->v[i2]);
+                    u2 = sft_vf_set1(m_attribs->u[i2]), v2 = sft_vf_set1(m_attribs->v[i2]);
+
+                    px0 = sft_vf_set1(m_verts->x[i0]), py0 = sft_vf_set1(m_verts->y[i0]), pz0 = sft_vf_set1(m_verts->z[i0]);
+                    nx0 = sft_vf_set1(m_attribs->nx[i0]), ny0 = sft_vf_set1(m_attribs->ny[i0]), nz0 = sft_vf_set1(m_attribs->nz[i0]);
+                    
+                    px1 = sft_vf_set1(m_verts->x[i1]), py1 = sft_vf_set1(m_verts->y[i1]), pz1 = sft_vf_set1(m_verts->z[i1]);
+                    nx1 = sft_vf_set1(m_attribs->nx[i1]), ny1 = sft_vf_set1(m_attribs->ny[i1]), nz1 = sft_vf_set1(m_attribs->nz[i1]);
+                    
+                    px2 = sft_vf_set1(m_verts->x[i2]), py2 = sft_vf_set1(m_verts->y[i2]), pz2 = sft_vf_set1(m_verts->z[i2]);
+                    nx2 = sft_vf_set1(m_attribs->nx[i2]), ny2 = sft_vf_set1(m_attribs->ny[i2]), nz2 = sft_vf_set1(m_attribs->nz[i2]);
                 }
 
+                // ---  fetch and transform to world space  ---
                 const sft_instance* inst = &sft_state->cmd_queue.instances[inst_ind];
+                const sftvmat v_transform = sft_vm_broadcast(inst->transform);
+
+                const sftvvec wp0 = sft_vv_transform((sftvvec){px0, py0, pz0}, v_transform);
+                const sftvvec wp1 = sft_vv_transform((sftvvec){px1, py1, pz1}, v_transform);
+                const sftvvec wp2 = sft_vv_transform((sftvvec){px2, py2, pz2}, v_transform);
+
+                // use transform_dir for normals to ignore translation
+                const sftvvec wn0 = sft_vv_transform_dir((sftvvec){nx0, ny0, nz0}, v_transform);
+                const sftvvec wn1 = sft_vv_transform_dir((sftvvec){nx1, ny1, nz1}, v_transform);
+                const sftvvec wn2 = sft_vv_transform_dir((sftvvec){nx2, ny2, nz2}, v_transform);
 
                 // ---  unconditional barycentric setup  ---
                 // evaluate the plane equations for all lanes in the block, even if they aren't part 
@@ -3715,12 +4011,29 @@ static SFT_INLINE void sft__resolve_tile(
                 const vf32 cu = sft_vf_fmadd(pW0, u0, sft_vf_fmadd(pW1, u1, sft_vf_mul(pW2, u2)));
                 const vf32 cv = sft_vf_fmadd(pW0, v0, sft_vf_fmadd(pW1, v1, sft_vf_mul(pW2, v2)));
 
-                // ---  screen space derivatives  ---
-                // generates the horizontal and vertical UV gradients
-                const vf32 ddx_u = sft_vf_ddx(cu);
-                const vf32 ddy_u = sft_vf_ddy(cu);
-                const vf32 ddx_v = sft_vf_ddx(cv);
-                const vf32 ddy_v = sft_vf_ddy(cv);
+                // ---  perspective correct interpolation  ---
+                sftvvec interp_pos;
+                interp_pos.x = sft_vf_fmadd(pW0, wp0.x, sft_vf_fmadd(pW1, wp1.x, sft_vf_mul(pW2, wp2.x)));
+                interp_pos.y = sft_vf_fmadd(pW0, wp0.y, sft_vf_fmadd(pW1, wp1.y, sft_vf_mul(pW2, wp2.y)));
+                interp_pos.z = sft_vf_fmadd(pW0, wp0.z, sft_vf_fmadd(pW1, wp1.z, sft_vf_mul(pW2, wp2.z)));
+
+                sftvvec interp_norm;
+                interp_norm.x = sft_vf_fmadd(pW0, wn0.x, sft_vf_fmadd(pW1, wn1.x, sft_vf_mul(pW2, wn2.x)));
+                interp_norm.y = sft_vf_fmadd(pW0, wn0.y, sft_vf_fmadd(pW1, wn1.y, sft_vf_mul(pW2, wn2.y)));
+                interp_norm.z = sft_vf_fmadd(pW0, wn0.z, sft_vf_fmadd(pW1, wn1.z, sft_vf_mul(pW2, wn2.z)));
+
+                // ---  normalization and vector setup  ---
+                const sftvvec N = sft_vv_norm_fast(interp_norm);
+                
+                // broadcast the camera position
+                const sftvvec v_cam_pos = {
+                    sft_vf_set1(sft_state->camera_pos.x),
+                    sft_vf_set1(sft_state->camera_pos.y),
+                    sft_vf_set1(sft_state->camera_pos.z)
+                };
+                
+                // V = normalize(cam_pos - world_pos)
+                const sftvvec V = sft_vv_norm_fast(sft_vv_sub(v_cam_pos, interp_pos));
 
                 // ---  material lookup  ---
                 const u16 mesh_ind = inst->model->meshlet_mesh_inds[m_ind];
@@ -3728,16 +4041,19 @@ static SFT_INLINE void sft__resolve_tile(
                 
                 u32 base_color_int = 0xFFFFFFFF;
                 sft_tex_handle tex_handle = SFT_INVALID_HANDLE;
+                f32 mat_shininess = 4.f;
                 
                 if (SFT_INVALID_HANDLE != mat_handle) {
-                    const u32 m_ind = SFT_MAT_INDEX(mat_handle);
+                    const u32 m_mat_ind = SFT_MAT_INDEX(mat_handle);
                     if (SFT_MAT_IS_TRANSIENT(mat_handle)) {
-                        base_color_int = sft_state->mat_pool_transient.base_color[m_ind];
-                        tex_handle = sft_state->mat_pool_transient.albedo_tex[m_ind];
+                        base_color_int = sft_state->mat_pool_transient.base_color[m_mat_ind];
+                        tex_handle = sft_state->mat_pool_transient.albedo_tex[m_mat_ind];
+                        mat_shininess = sft_state->mat_pool_transient.shininess[m_mat_ind];
                     }
                     else {
-                        base_color_int = sft_state->mat_pool.base_color[m_ind];
-                        tex_handle = sft_state->mat_pool.albedo_tex[m_ind];
+                        base_color_int = sft_state->mat_pool.base_color[m_mat_ind];
+                        tex_handle = sft_state->mat_pool.albedo_tex[m_mat_ind];
+                        mat_shininess = sft_state->mat_pool.shininess[m_mat_ind];
                     }
                 }
 
@@ -3747,14 +4063,151 @@ static SFT_INLINE void sft__resolve_tile(
                 const vf32 base_g = sft_vf_mul(sft_vf_set1((f32)((base_color_int >> 8) & 0xFF)), inv255);
                 const vf32 base_b = sft_vf_mul(sft_vf_set1((f32)((base_color_int >> 0) & 0xFF)), inv255);
 
-                // texture sampling
-                vf32 tex_r, tex_g, tex_b;
-                sft__sample_tex_bilinear(tex_handle, cu, cv, ddx_u, ddy_u, ddx_v, ddy_v, v_tri_mask, x, y, &tex_r, &tex_g, &tex_b);
+                // ---  texture sampling  ---
+                const vf32 ddx_u = sft_vf_ddx(cu);
+                const vf32 ddy_u = sft_vf_ddy(cu);
+                const vf32 ddx_v = sft_vf_ddx(cv);
+                const vf32 ddy_v = sft_vf_ddy(cv);
 
-                // final albedo
-                vf32 final_r = sft_vf_mul(tex_r, base_r);
-                vf32 final_g = sft_vf_mul(tex_g, base_g);
-                vf32 final_b = sft_vf_mul(tex_b, base_b);
+                const i32 lod = sft__calculate_lod(tex_handle, ddx_u, ddy_u, ddx_v, ddy_v, v_tri_mask, x, y);
+                vf32 tex_r, tex_g, tex_b;
+                
+                // texels are so small that bilinear isn't noticeable
+                if (lod > 1) {
+                    sft__sample_tex_nearest(tex_handle, lod, cu, cv, &tex_r, &tex_g, &tex_b);
+                }
+                else {
+                    sft__sample_tex_bilinear(tex_handle, lod, cu, cv, &tex_r, &tex_g, &tex_b);
+                }
+                
+                const vf32 albedo_r = sft_vf_mul(tex_r, base_r);
+                const vf32 albedo_g = sft_vf_mul(tex_g, base_g);
+                const vf32 albedo_b = sft_vf_mul(tex_b, base_b);
+
+                // ---  lighting accumulation setup  ---
+                const vf32 v_n = sft_vf_set1(mat_shininess);
+                const vf32 v_specular_scale = sft_vf_set1(((mat_shininess + 8.f) / 8.f) * 0.04f);
+
+                // initialize with ambient
+                vf32 diffuse_r = sft_vf_set1(sft_state->ambient_light.x);
+                vf32 diffuse_g = sft_vf_set1(sft_state->ambient_light.y);
+                vf32 diffuse_b = sft_vf_set1(sft_state->ambient_light.z);
+                
+                vf32 spec_r = v_zero;
+                vf32 spec_g = v_zero;
+                vf32 spec_b = v_zero;
+
+                // ---  directional lights accumulation loop  ---
+                const i32 dir_count = sft_state->lighting.directional_count.count;
+                for (i32 l = 0; l < dir_count; l += 1) {
+                    const sftvec l_dir = sft_state->lighting.directional[l].dir;
+                    const sftvec l_col = sft_state->lighting.directional[l].color;
+                    
+                    const sftvvec L = { sft_vf_set1(l_dir.x), sft_vf_set1(l_dir.y), sft_vf_set1(l_dir.z) };
+                    const vf32 lr = sft_vf_set1(l_col.x);
+                    const vf32 lg = sft_vf_set1(l_col.y);
+                    const vf32 lb = sft_vf_set1(l_col.z);
+
+                    // diffuse
+                    const vf32 n_dot_l = sft_vf_max(sft_vv_dot(N, L), v_zero);
+                    const vf32 lit_mask = sft_vf_cmp_gt(n_dot_l, v_zero);
+                    
+                    // diffuse += n_dot_l * light_color
+                    diffuse_r = sft_vf_fmadd(n_dot_l, lr, diffuse_r);
+                    diffuse_g = sft_vf_fmadd(n_dot_l, lg, diffuse_g);
+                    diffuse_b = sft_vf_fmadd(n_dot_l, lb, diffuse_b);
+
+                    // skip specular math if the block is entirely unlit
+                    if (0 == sft_vf_movemask(lit_mask)) {
+                        continue;
+                    }
+
+                    // specular
+                    const sftvvec H = sft_vv_norm_fast(sft_vv_add(L, V));
+                    const vf32 n_dot_h = sft_vf_max(sft_vv_dot(N, H), v_zero);
+                    
+                    const vf32 denom = sft_vf_add(sft_vf_sub(v_n, sft_vf_mul(v_n, n_dot_h)), n_dot_h);
+                    const vf32 spec = sft_vf_mul(n_dot_h, sft_vf_rcp_refined(denom));
+                    
+                    vf32 specular_term = sft_vf_mul(sft_vf_mul(spec, v_specular_scale), n_dot_l);
+                    specular_term = sft_vf_and(specular_term, lit_mask);
+
+                    // spec += specular_term * light_color
+                    spec_r = sft_vf_fmadd(specular_term, lr, spec_r);
+                    spec_g = sft_vf_fmadd(specular_term, lg, spec_g);
+                    spec_b = sft_vf_fmadd(specular_term, lb, spec_b);
+                }
+
+                // ---  point lights accumulation loop  ---
+                for (i32 i = 0; i < tile_light_count; i += 1) {
+                    const u16 l = tile_lights[i];
+                    
+                    const sftvec l_pos = sft_state->lighting.point[l].pos;
+                    const sftvec l_col = sft_state->lighting.point[l].color;
+                    const f32 l_inv_r2 = sft_state->lighting.point[l].inv_radius_sqr;
+                    
+                    const sftvvec v_light_pos = { sft_vf_set1(l_pos.x), sft_vf_set1(l_pos.y), sft_vf_set1(l_pos.z) };
+                    const vf32 lr = sft_vf_set1(l_col.x);
+                    const vf32 lg = sft_vf_set1(l_col.y);
+                    const vf32 lb = sft_vf_set1(l_col.z);
+                    const vf32 v_inv_r2 = sft_vf_set1(l_inv_r2);
+
+                    // L_raw = light_pos - world_pos
+                    const sftvvec L_raw = sft_vv_sub(v_light_pos, interp_pos);
+                    
+                    // distance squared
+                    const vf32 d2 = sft_vv_dot(L_raw, L_raw);
+                    
+                    // more intuitive falloff: max(0, 1 - (d^2 / r^2))^2
+                    // creates a smooth bell curve that hits exactly 0.0 at the radius
+                    vf32 attenuation = sft_vf_max(v_zero, sft_vf_fnmadd(d2, v_inv_r2, v_one));
+                    attenuation = sft_vf_mul(attenuation, attenuation);
+                    
+                    // skip lighting math if attenuation is zero
+                    const vf32 active_light_mask = sft_vf_cmp_gt(attenuation, v_zero);
+                    if (0 == sft_vf_movemask(active_light_mask)) {
+                        continue;
+                    }
+
+                    // normalize L
+                    const sftvvec L = sft_vv_norm_fast(L_raw);
+
+                    // diffuse
+                    const vf32 n_dot_l = sft_vf_max(sft_vv_dot(N, L), v_zero);
+                    vf32 lit_mask = sft_vf_and(sft_vf_cmp_gt(n_dot_l, v_zero), active_light_mask);
+                    
+                    // diffuse += n_dot_l * light_color * attenuation
+                    const vf32 diff_intensity = sft_vf_mul(n_dot_l, attenuation);
+                    diffuse_r = sft_vf_fmadd(diff_intensity, lr, diffuse_r);
+                    diffuse_g = sft_vf_fmadd(diff_intensity, lg, diffuse_g);
+                    diffuse_b = sft_vf_fmadd(diff_intensity, lb, diffuse_b);
+
+                    // skip specular math if the block is entirely unlit
+                    if (0 == sft_vf_movemask(lit_mask)) {
+                        continue; 
+                    }
+
+                    // specular
+                    const sftvvec H = sft_vv_norm_fast(sft_vv_add(L, V));
+                    const vf32 n_dot_h = sft_vf_max(sft_vv_dot(N, H), v_zero);
+                    
+                    const vf32 denom = sft_vf_add(sft_vf_sub(v_n, sft_vf_mul(v_n, n_dot_h)), n_dot_h);
+                    const vf32 spec = sft_vf_mul(n_dot_h, sft_vf_rcp_refined(denom));
+                    
+                    vf32 specular_term = sft_vf_mul(sft_vf_mul(spec, v_specular_scale), diff_intensity);
+                    specular_term = sft_vf_and(specular_term, lit_mask);
+
+                    // spec += specular_term * light_color
+                    spec_r = sft_vf_fmadd(specular_term, lr, spec_r);
+                    spec_g = sft_vf_fmadd(specular_term, lg, spec_g);
+                    spec_b = sft_vf_fmadd(specular_term, lb, spec_b);
+                }
+
+                // ---  final color combination  ---
+                // final = (albedo * diffuse_total) + spec_total
+                vf32 final_r = sft_vf_fmadd(albedo_r, diffuse_r, spec_r);
+                vf32 final_g = sft_vf_fmadd(albedo_g, diffuse_g, spec_g);
+                vf32 final_b = sft_vf_fmadd(albedo_b, diffuse_b, spec_b);
 
                 // re pack to 8 bit integer
                 const vf32 v_255 = sft_vf_set1(255.f);
@@ -4057,7 +4510,7 @@ SFT_FUNC sft_model* sft_model_load_glb(const char* filename, sft_arena* arena, i
                 } 
             }
         }
-        mat_handles[i] = sft_material_create(tex, base_color, 16.0f);
+        mat_handles[i] = sft_material_create(tex, base_color, 2.f);
     }
 
     // ---  allocate model  ---
@@ -4508,6 +4961,11 @@ SFT_FUNC void sft_init(i32 width, i32 height, i32 requested_threads) {
         sft_arena_init(&sft_state->tex_heap_arena, 4ULL * 1024 * 1024 * 1024);
         sft_state->mat_pool.free_head = -1;
         sft_state->tex_pool.free_head = -1;
+
+        sft_arena_init(&sft_state->light_arena, 16ULL * 1024 * 1024);
+        // directional at the start and point offset by 8MB
+        sft_state->lighting.directional = (sft_directional_light*)sft_state->light_arena.base;
+        sft_state->lighting.point = (sft_point_light*)(sft_state->light_arena.base + (8ULL * 1024 * 1024));
     }
 
     { // ---  initialize display  ---
@@ -4550,7 +5008,7 @@ SFT_FUNC void sft_init(i32 width, i32 height, i32 requested_threads) {
         free(checker_pixels);
 
         // create the material
-        sft_state->base_mat = sft_material_create(checker_tex, 0xFFFFFFFF, 16.f);
+        sft_state->base_mat = sft_material_create(checker_tex, 0xFFFFFFFF, 2.f);
     }
 }
 
@@ -4583,9 +5041,9 @@ SFT_FUNC void sft_present(void) {
     memset(sft_state->display.tile_payload_counts, 0, total_tiles * sizeof(i32));
 
     // exact fit bulk commit for the screen space cache
-    if (sft_state->cmd_queue.total_ss_meshlets > 0) {
+    if (sft_state->cmd_queue.total_ss_meshlets.count > 0) {
         sft_arena_commit_if_needed(&sft_state->scratch_arena, 
-            sft_state->cmd_queue.total_ss_meshlets * sizeof(struct sft_ss_meshlet));
+            sft_state->cmd_queue.total_ss_meshlets.count * sizeof(struct sft_ss_meshlet));
     }
 
     // wake all worker threads to process the queue
@@ -4603,16 +5061,19 @@ SFT_FUNC void sft_frame_begin(void) {
     sft_arena_frame_begin(&sft_state->chunk_arena);
     sft_arena_frame_begin(&sft_state->scratch_arena);
     sft_arena_frame_begin(&sft_state->clip_arena);
+    sft_arena_frame_begin(&sft_state->light_arena);
 }
 
 SFT_FUNC void sft_frame_end(void) {
-    sft_state->cmd_queue.instance_count = 0;
-    sft_state->cmd_queue.job_count = 0;
+    sft_state->cmd_queue.instance_count.count = 0;
+    sft_state->cmd_queue.job_count.count = 0;
     sft_state->next_job_ind.count = 0;
     sft_state->next_tile_ind.count = 0;
-    sft_state->cmd_queue.total_ss_meshlets = 0;
+    sft_state->cmd_queue.total_ss_meshlets.count = 0;
     sft_state->clip_cache.count = 0;
     sft_state->mat_pool_transient.count = 0;
+    sft_state->lighting.directional_count.count = 0;
+    sft_state->lighting.point_count.count = 0;
 }
 
 SFT_FUNC void sft_set_camera(sftvec cam_pos, sftmat view, sftmat proj) {
@@ -4644,7 +5105,7 @@ SFT_FUNC void sft_set_camera(sftvec cam_pos, sftmat view, sftmat proj) {
 
 SFT_FUNC void sft_draw_instance(const sft_instance* inst) {
     // claim instance slot
-    const i32 inst_slot = sft_atomic_add(&sft_state->cmd_queue.instance_count, 1);
+    const i32 inst_slot = sft_atomic_add(&sft_state->cmd_queue.instance_count.count, 1);
     
     // strict bit packing validation guard
     if (inst_slot >= SFT_MAX_INSTANCES_PER_FRAME) {
@@ -4655,7 +5116,7 @@ SFT_FUNC void sft_draw_instance(const sft_instance* inst) {
     sft_state->cmd_queue.instances[inst_slot] = *inst;
 
     sft_state->cmd_queue.instances[inst_slot].ss_meshlet_offset =
-        sft_atomic_add(&sft_state->cmd_queue.total_ss_meshlets, inst->model->total_meshlets);
+        sft_atomic_add(&sft_state->cmd_queue.total_ss_meshlets.count, inst->model->total_meshlets);
 
     // slice geometry into jobs
     for (u32 m = 0; m < inst->model->mesh_count; m += 1) {
@@ -4665,7 +5126,7 @@ SFT_FUNC void sft_draw_instance(const sft_instance* inst) {
 
         while (meshlets_remaining > 0) {
             const u32 count = SFT_CLAMP((i32)meshlets_remaining, 0, SFT_MESHLETS_PER_JOB);
-            const i32 job_slot = sft_atomic_add(&sft_state->cmd_queue.job_count, 1);
+            const i32 job_slot = sft_atomic_add(&sft_state->cmd_queue.job_count.count, 1);
             
             sft_arena_commit_if_needed(&sft_state->job_arena, (job_slot + 1) * sizeof(struct sft_geom_job));
             
@@ -4678,6 +5139,38 @@ SFT_FUNC void sft_draw_instance(const sft_instance* inst) {
             meshlets_remaining -= count;
         }
     }
+}
+
+SFT_FUNC void sft_set_ambient_light(f32 r, f32 g, f32 b) {
+    sft_state->ambient_light.x = r;
+    sft_state->ambient_light.y = g;
+    sft_state->ambient_light.z = b;
+}
+
+SFT_FUNC void sft_draw_directional_light(sftvec dir, f32 r, f32 g, f32 b, f32 intensity) {
+    const i32 slot = sft_atomic_add(&sft_state->lighting.directional_count.count, 1);
+    
+    sft_arena_commit_if_needed(&sft_state->light_arena, (slot + 1) * sizeof(sft_directional_light));
+
+    sft_state->lighting.directional[slot].dir = sft_v_norm(dir);
+    sft_state->lighting.directional[slot].color.x = r * intensity;
+    sft_state->lighting.directional[slot].color.y = g * intensity;
+    sft_state->lighting.directional[slot].color.z = b * intensity;
+}
+
+SFT_FUNC void sft_draw_point_light(sftvec pos, f32 r, f32 g, f32 b, f32 intensity, f32 radius) {
+    const i32 slot = sft_atomic_add(&sft_state->lighting.point_count.count, 1);
+    
+    const u64 required_bytes = (8ULL * 1024 * 1024) + ((slot + 1) * sizeof(sft_point_light));
+    sft_arena_commit_if_needed(&sft_state->light_arena, required_bytes);
+
+    sft_state->lighting.point[slot].pos = pos;
+    sft_state->lighting.point[slot].color.x = r * intensity;
+    sft_state->lighting.point[slot].color.y = g * intensity;
+    sft_state->lighting.point[slot].color.z = b * intensity;
+    sft_state->lighting.point[slot].radius = radius;
+    
+    sft_state->lighting.point[slot].inv_radius_sqr = 1.f / (radius * radius);
 }
 
 #ifdef SFT_USE_STB_IMAGE
