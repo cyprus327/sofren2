@@ -1,7 +1,7 @@
 // IF YOU CAN SEE THESE THREE LINES THEN I JUST FORGOT TO REMOVE THEM
-#define SFT_IMPL
-#define SFT_USE_CGLTF
-#define SFT_USE_STB_IMAGE
+// #define SFT_IMPL
+// #define SFT_USE_CGLTF
+// #define SFT_USE_STB_IMAGE
 
 #ifndef SFT_H
 #define SFT_H
@@ -762,6 +762,8 @@ SFT_FUNC void sft_set_ambient_light(f32 r, f32 g, f32 b);
 SFT_FUNC void sft_draw_directional_light(sftvec dir, f32 r, f32 g, f32 b, f32 intensity);
 //  every 'light_id' provided is expected to be unique
 SFT_FUNC void sft_draw_point_light(sftvec pos, f32 r, f32 g, f32 b, f32 intensity, f32 radius, u32 light_id);
+SFT_FUNC void sft_set_shadows_enabled(u8 enabled);
+SFT_FUNC void sft_invalidate_shadows(void);
 
 // texture functions
 #ifdef SFT_USE_STB_IMAGE
@@ -790,6 +792,7 @@ SFT_FUNC void sft_arena_frame_begin(sft_arena* arena);
 #ifdef SFT_USE_CGLTF
 SFT_FUNC sft_model* sft_model_load_glb(const char* path, sft_arena* arena, i32 uv_channel);
 #endif
+SFT_FUNC sft_model* sft_model_load_qsf(const char* path, sft_arena* arena);
 // TODO copy obj loader from sofren
 // SFT_FUNC sft_model* sft_model_load_obj(const char* path);
 
@@ -1210,6 +1213,8 @@ static struct sft_state {
         struct sft_shadow_grid_job* wrapped_jobs;
         i32 wrapped_job_count, wrapped_job_cap;
         struct sft_atomic_counter next_wrapped_job_ind;
+
+        u8 enabled;
     } shadow_grid;
 
     struct sft_frustum frustum;
@@ -1486,7 +1491,7 @@ SFT_INLINE sftmat sft_m_view_look_at(sftvec pos, sftvec target, sftvec up) {
     const sftvec forward = sft_v_norm(sft_v_sub(target, pos));
     
     // safety check for looking straight down
-    if (fabsf(forward.x) < 0.001f && fabsf(forward.z) < 0.001f) {
+    if (fabsf(forward.x) < SFT_EPSILON && fabsf(forward.z) < SFT_EPSILON) {
         up = SFT_V(0.f, 0.f, -1.f);
     }
 
@@ -3162,7 +3167,7 @@ static SFT_INLINE vf32 sft__ray_packet_vs_triangle_any_hit(
     const vf32 t = sft_vf_mul(f, sft_vv_dot(e2, q));
     
     // intersection must strictly occur before the light source and past the self intersection bias
-    const vf32 v_t_min = sft_vf_set1(0.001f); // shadow bias
+    const vf32 v_t_min = sft_vf_set1(SFT_EPSILON); // shadow bias
     mask = sft_vf_and(mask, sft_vf_and(sft_vf_cmp_gt(t, v_t_min), sft_vf_cmp_lt(t, t_max)));
 
     return mask; // 0xFFFFFFFF in lanes that hit, 0x0 in lanes that missed
@@ -3291,7 +3296,7 @@ static SFT_INLINE void sft__build_packet_frustum(
     
     for (i32 i = 0; i < 8; i += 1) {
         const sftvec c_lv = sft_m_mul_quat(l_view, (sftquat){corners[i].x, corners[i].y, corners[i].z, 1.f});
-        if (c_lv.z < 0.001f) {
+        if (c_lv.z < SFT_EPSILON) {
             is_invalid = 1;
             break;
         }
@@ -3947,7 +3952,7 @@ const vf32 v_voxel_size = sft_vf_set1(cascade->voxel_size);
     const i32 u32_offset = (light_bit_ind >= 32) ? 1 : 0;
     const vi32 v_u32_offset = sft_vi_set1(u32_offset);
     const vi32 v_test_bit = sft_vi_set1(1U << bit_shift);
-    const vf32 v_one_f = sft_vf_set1(1.0f);
+    const vf32 v_one_f = sft_vf_set1(1.f);
     const vf32 v_zero_f = sft_vf_setzero();
 
     #define GATHER_BIT(ind) \
@@ -5203,13 +5208,24 @@ static SFT_INLINE void sft__resolve_tile(
 
         for (i32 l = 0; l < total_point_lights; l += 1) {
             const sftvec pos = sft_state->lighting.point[l].pos;
-            const f32 radius = sft_state->lighting.point[l].radius * 100.f;
-            // TODO remove the "* 100.f" hack                      ^^^^^^^
+            const f32 radius = sft_state->lighting.point[l].radius;
 
+            // the light's linear w
             const f32 w = pos.x * vp->m[0][3] + pos.y * vp->m[1][3] + pos.z * vp->m[2][3] + vp->m[3][3];
-            
+
+            // linear bounds
+            const f32 linear_min = w - radius;
+            const f32 linear_max = w + radius;
+
+            // if the light's volume clips behind the camera
+            const f32 safe_linear_min = (linear_min > SFT_EPSILON) ? linear_min : SFT_EPSILON;
+
+            // convert to 1/w space (min and max swap because of the inversion)
+            const f32 light_inv_w_min = 1.f / linear_max;
+            const f32 light_inv_w_max = 1.f / safe_linear_min;
+
             // Z cull
-            if ((w + radius) < tile_min_z || (w - radius) > tile_max_z) {
+            if (light_inv_w_max < tile_min_z || light_inv_w_min > tile_max_z) {
                 continue; 
             }
 
@@ -5221,9 +5237,15 @@ static SFT_INLINE void sft__resolve_tile(
                 const f32 sx = (tx / w + 1.f) * hw + vpx;
                 const f32 sy = (-ty / w + 1.f) * hh + vpy;
 
-                const f32 safe_w = SFT_MAX(w - radius, 0.001f);
-                const f32 rx_screen = fabsf((radius * vp->m[0][0]) / safe_w * hw);
-                const f32 ry_screen = fabsf((radius * vp->m[1][1]) / safe_w * hh);
+                // extract the pure projection scales by getting the length of the VP matrix columns
+                const f32 proj_scale_x = sqrtf(vp->m[0][0]*vp->m[0][0] + vp->m[1][0]*vp->m[1][0] + vp->m[2][0]*vp->m[2][0]);
+                const f32 proj_scale_y = sqrtf(vp->m[0][1]*vp->m[0][1] + vp->m[1][1]*vp->m[1][1] + vp->m[2][1]*vp->m[2][1]);
+
+                const f32 safe_w = SFT_MAX(w - radius, SFT_EPSILON);
+
+                // scale the radius using the pure projection factors, not the view dependent ones
+                const f32 rx_screen = fabsf((radius * proj_scale_x) / safe_w * hw);
+                const f32 ry_screen = fabsf((radius * proj_scale_y) / safe_w * hh);
 
                 const f32 l_min_x = sx - rx_screen;
                 const f32 l_max_x = sx + rx_screen;
@@ -5642,7 +5664,7 @@ static SFT_INLINE void sft__resolve_tile(
                     
                     // ---  volumetric shadow grid  ---
                     vf32 v_shadow_intensity;
-                    if (light->bitmask_ind == -1) {
+                    if (-1 == light->bitmask_ind || !sft_state->shadow_grid.enabled) {
                         v_shadow_intensity = v_one;
                     }
                     else {
@@ -5659,7 +5681,7 @@ static SFT_INLINE void sft__resolve_tile(
                             const f32 blend_range = safe_radius - blend_start;
                             
                             const vf32 v_blend_start = sft_vf_set1(blend_start);
-                            const vf32 v_inv_blend_range = sft_vf_set1(1.0f / blend_range);
+                            const vf32 v_inv_blend_range = sft_vf_set1(1.f / blend_range);
                             
                             // calculate blend factor: clamp((depth - blend_start) / blend_range, 0.0, 1.0)
                             vf32 v_blend = sft_vf_mul(sft_vf_sub(v_depth_dist, v_blend_start), v_inv_blend_range);
@@ -5681,7 +5703,7 @@ static SFT_INLINE void sft__resolve_tile(
                             const f32 blend_range = safe_radius - blend_start;
                             
                             const vf32 v_blend_start = sft_vf_set1(blend_start);
-                            const vf32 v_inv_blend_range = sft_vf_set1(1.0f / blend_range);
+                            const vf32 v_inv_blend_range = sft_vf_set1(1.f / blend_range);
                             
                             // calculate blend factor: clamp((depth - blend_start) / blend_range, 0.0, 1.0)
                             vf32 v_blend = sft_vf_mul(sft_vf_sub(v_depth_dist, v_blend_start), v_inv_blend_range);
@@ -5832,9 +5854,11 @@ static void sft__worker_thread(void* user_data) {
         sft_sem_wait(&sft_state->sem_start);
 
         // ---  shadow grid update pass  ---
-        sft__worker_phase_shadows();
-        sft__worker_phase_wrapped_cells();
-        sft__barrier_wait(&sft_state->shadow_barrier);
+        if (sft_state->shadow_grid.enabled) {
+            sft__worker_phase_shadows();
+            sft__worker_phase_wrapped_cells();
+            sft__barrier_wait(&sft_state->shadow_barrier);
+        }
 
         const i32 total_tiles = sft_state->display.tile_cols * sft_state->display.tile_rows;
         
@@ -6035,27 +6059,35 @@ SFT_FUNC sft_model* sft_model_load_glb(const char* filename, sft_arena* arena, i
 
     // ---  pre load materials  ---
     sft_mat_handle* mat_handles = (sft_mat_handle*)malloc(data->materials_count * sizeof(sft_mat_handle));
-    for (cgltf_size i = 0; i < data->materials_count; i += 1) {
-        const cgltf_material* mat = &data->materials[i];
-        u32 base_color = 0xFFFFFFFF;
-        sft_tex_handle tex = SFT_INVALID_HANDLE;
 
-        if (mat->has_pbr_metallic_roughness) {
-            const f32* c = mat->pbr_metallic_roughness.base_color_factor;
-            base_color = ((u32)(c[3] * 255.f) << 24) | ((u32)(c[0] * 255.f) << 16) | 
-                         ((u32)(c[1] * 255.f) << 8)  | ((u32)(c[2] * 255.f) << 0);
+    #ifdef SFT_USE_STB_IMAGE
+        for (cgltf_size i = 0; i < data->materials_count; i += 1) {
+            const cgltf_material* mat = &data->materials[i];
+            u32 base_color = 0xFFFFFFFF;
+            sft_tex_handle tex = SFT_INVALID_HANDLE;
 
-            const cgltf_texture_view* tv = &mat->pbr_metallic_roughness.base_color_texture;
-            if (tv->texture && tv->texture->image) {
-                const cgltf_image* img = tv->texture->image;
-                if (img->buffer_view && img->buffer_view->buffer->data) {
-                    const u8* img_data = (u8*)img->buffer_view->buffer->data + img->buffer_view->offset;
-                    tex = sft_texture_load_from_memory(img_data, img->buffer_view->size);
-                } 
+            if (mat->has_pbr_metallic_roughness) {
+                const f32* c = mat->pbr_metallic_roughness.base_color_factor;
+                base_color = ((u32)(c[3] * 255.f) << 24) | ((u32)(c[0] * 255.f) << 16) | 
+                            ((u32)(c[1] * 255.f) << 8)  | ((u32)(c[2] * 255.f) << 0);
+
+                const cgltf_texture_view* tv = &mat->pbr_metallic_roughness.base_color_texture;
+                if (tv->texture && tv->texture->image) {
+                    const cgltf_image* img = tv->texture->image;
+                    if (img->buffer_view && img->buffer_view->buffer->data) {
+                        const u8* img_data = (u8*)img->buffer_view->buffer->data + img->buffer_view->offset;
+                        tex = sft_texture_load_from_memory(img_data, img->buffer_view->size);
+                    } 
+                }
             }
+            mat_handles[i] = sft_material_create(tex, base_color, 2.f);
         }
-        mat_handles[i] = sft_material_create(tex, base_color, 2.f);
-    }
+    #else
+        #warning "SFT WARNING: using 'cgltf' but not 'stb_image' will cause GLB/GLTF model textures to use fallback checkerboard"
+        for (cgltf_size i = 0; i < data->materials_count; i += 1) {
+            mat_handles[i] = sft_state->base_mat;
+        }
+    #endif
 
     // ---  allocate model  ---
     sft_model* model = (sft_model*)sft_arena_alloc(arena, sizeof(sft_model));
@@ -6466,6 +6498,128 @@ SFT_FUNC sft_model* sft_model_load_glb(const char* filename, sft_arena* arena, i
 }
 
 #endif // SFT_USE_CGLTF
+
+SFT_FUNC sft_model* sft_model_load_qsf(const char* path, sft_arena* arena) {
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        SFT_ERR_RET(NULL, "failed to open '%s'\n", path);
+    }
+
+    char magic[4];
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "QSF2", 4) != 0) {
+        fclose(f);
+        SFT_ERR_RET(NULL, "invalid QSF2 magic in '%s'\n", path);
+    }
+
+    u32 version;
+    fread(&version, 4, 1, f);
+    if (1 != version) {
+        fclose(f);
+        SFT_ERR_RET(NULL, "unsupported QSF2 version\n");
+    }
+
+    // skip the game data offset
+    u64 game_data_offset;
+    fread(&game_data_offset, 8, 1, f);
+
+    // ---  textures and materials  ---
+    u32 tex_count;
+    fread(&tex_count, 4, 1, f);
+    
+    sft_mat_handle* mat_handles = sft_arena_alloc(arena, tex_count * sizeof(sft_mat_handle));
+    
+    for (u32 i = 0; i < tex_count; i += 1) {
+        u32 w, h;
+        fread(&w, 4, 1, f);
+        fread(&h, 4, 1, f);
+        
+        u32* pixels = malloc(w * h * sizeof(u32));
+        fread(pixels, 4, w * h, f);
+        
+        const sft_tex_handle tex = sft_texture_create(w, h, pixels);
+        mat_handles[i] = sft_material_create(tex, 0xFFFFFFFF, 2.f);
+        free(pixels);
+    }
+
+    // ---  model header  ---
+    sft_model* model = (sft_model*)sft_arena_alloc(arena, sizeof(sft_model));
+    fread(&model->mesh_count, 4, 1, f);
+    fread(&model->total_meshlets, 4, 1, f);
+    fread(&model->blas_node_count, 4, 1, f);
+    fread(&model->blas_root_ind, 4, 1, f);
+
+    // ---  meshes  ---
+    model->meshes = (sft_mesh*)sft_arena_alloc(arena, model->mesh_count * sizeof(sft_mesh));
+    for (u32 i = 0; i < model->mesh_count; i += 1) {
+        sft_mesh* mesh = &model->meshes[i];
+        
+        fread(&mesh->meshlet_count, 4, 1, f);
+        fread(&mesh->model_meshlet_offset, 4, 1, f);
+        
+        u32 tex_ind;
+        fread(&tex_ind, 4, 1, f);
+        mesh->material = (tex_ind < tex_count) ? mat_handles[tex_ind] : sft_state->base_mat;
+
+        const u32 mc = mesh->meshlet_count;
+        
+        mesh->meshlets = (struct sft_meshlet*)sft_arena_alloc(arena, mc * sizeof(struct sft_meshlet));
+        fread(mesh->meshlets, sizeof(struct sft_meshlet), mc, f);
+
+        mesh->meshlet_attribs = (struct sft_meshlet_attribs*)sft_arena_alloc(arena, mc * sizeof(struct sft_meshlet_attribs));
+        fread(mesh->meshlet_attribs, sizeof(struct sft_meshlet_attribs), mc, f);
+
+        mesh->inds = (struct sft_meshlet_inds*)sft_arena_alloc(arena, mc * sizeof(struct sft_meshlet_inds));
+        fread(mesh->inds, sizeof(struct sft_meshlet_inds), mc, f);
+
+        // bounding spheres
+        mesh->bounds_center_x = (f32*)sft_arena_alloc(arena, mc * sizeof(f32));
+        mesh->bounds_center_y = (f32*)sft_arena_alloc(arena, mc * sizeof(f32));
+        mesh->bounds_center_z = (f32*)sft_arena_alloc(arena, mc * sizeof(f32));
+        mesh->bounds_radius   = (f32*)sft_arena_alloc(arena, mc * sizeof(f32));
+        fread(mesh->bounds_center_x, sizeof(f32), mc, f);
+        fread(mesh->bounds_center_y, sizeof(f32), mc, f);
+        fread(mesh->bounds_center_z, sizeof(f32), mc, f);
+        fread(mesh->bounds_radius, sizeof(f32), mc, f);
+        
+        // AABBs
+        mesh->bounds_min_x = (f32*)sft_arena_alloc(arena, mc * sizeof(f32));
+        mesh->bounds_min_y = (f32*)sft_arena_alloc(arena, mc * sizeof(f32));
+        mesh->bounds_min_z = (f32*)sft_arena_alloc(arena, mc * sizeof(f32));
+        mesh->bounds_max_x = (f32*)sft_arena_alloc(arena, mc * sizeof(f32));
+        mesh->bounds_max_y = (f32*)sft_arena_alloc(arena, mc * sizeof(f32));
+        mesh->bounds_max_z = (f32*)sft_arena_alloc(arena, mc * sizeof(f32));
+        fread(mesh->bounds_min_x, sizeof(f32), mc, f);
+        fread(mesh->bounds_min_y, sizeof(f32), mc, f);
+        fread(mesh->bounds_min_z, sizeof(f32), mc, f);
+        fread(mesh->bounds_max_x, sizeof(f32), mc, f);
+        fread(mesh->bounds_max_y, sizeof(f32), mc, f);
+        fread(mesh->bounds_max_z, sizeof(f32), mc, f);
+
+        // cone culling
+        mesh->cone_axis_x = (f32*)sft_arena_alloc(arena, mc * sizeof(f32));
+        mesh->cone_axis_y = (f32*)sft_arena_alloc(arena, mc * sizeof(f32));
+        mesh->cone_axis_z = (f32*)sft_arena_alloc(arena, mc * sizeof(f32));
+        mesh->cone_cutoff = (f32*)sft_arena_alloc(arena, mc * sizeof(f32));
+        fread(mesh->cone_axis_x, sizeof(f32), mc, f);
+        fread(mesh->cone_axis_y, sizeof(f32), mc, f);
+        fread(mesh->cone_axis_z, sizeof(f32), mc, f);
+        fread(mesh->cone_cutoff, sizeof(f32), mc, f);
+    }
+
+    // ---  global topology and BVH  ---
+    if (model->total_meshlets > 0) {
+        model->meshlet_mesh_inds = (u16*)sft_arena_alloc(arena, model->total_meshlets * sizeof(u16));
+        fread(model->meshlet_mesh_inds, sizeof(u16), model->total_meshlets, f);
+    }
+    
+    if (model->blas_node_count > 0) {
+        model->blas_nodes = (struct sft_bvh_node*)sft_arena_alloc(arena, model->blas_node_count * sizeof(struct sft_bvh_node));
+        fread(model->blas_nodes, sizeof(struct sft_bvh_node), model->blas_node_count, f);
+    }
+
+    fclose(f);
+    return model;
+}
 
 
 /*================================================================
@@ -6897,6 +7051,25 @@ SFT_FUNC void sft_draw_point_light(sftvec pos, f32 r, f32 g, f32 b, f32 intensit
     sft_state->lighting.point[slot].inv_radius_sqr = 1.f / (radius * radius);
     sft_state->lighting.point[slot].bitmask_ind = assigned_bit_ind;
     sft_state->lighting.point[slot].is_dirty = light_needs_grid_update;
+}
+
+SFT_FUNC void sft_set_shadows_enabled(u8 enabled) {
+    sft_state->shadow_grid.enabled = enabled;
+}
+
+SFT_FUNC void sft_invalidate_shadows(void) {
+    for (i32 c = 0; c < SFT_ARRLEN(sft_state->shadow_grid.cascades); c += 1) {
+        struct sft_shadow_cascade* cascade = &sft_state->shadow_grid.cascades[c];
+        const i32 total_voxels = cascade->res * cascade->res * cascade->res;
+        memset(cascade->voxel_data, 0xFF, total_voxels * sizeof(u64));
+    }
+    
+    // mark all lights as dirty
+    for (i32 i = 0; i < sft_state->lighting.point_count.count; i += 1) {
+        if (SFT_INVALID_BITMASK_IND != sft_state->lighting.point[i].bitmask_ind) {
+            sft_state->lighting.point[i].is_dirty = 1;
+        }
+    }
 }
 
 #ifdef SFT_USE_STB_IMAGE
