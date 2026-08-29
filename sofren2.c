@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdalign.h>
+#include <string.h>
 #include <math.h>
 
 #ifdef __cplusplus
@@ -152,7 +153,7 @@ typedef u32 sft_mat_handle;
 
 #define SFT_VERTS_PER_MESHLET 64
 
-#define SFT_MESHLETS_PER_JOB 2
+#define SFT_MESHLETS_PER_JOB 8
 
 #define SFT_CHUNK_CAPACITY 63
 
@@ -627,6 +628,13 @@ typedef u32 sft_mat_handle;
     #ifndef MAP_ANONYMOUS
         #define MAP_ANONYMOUS 0x20
     #endif
+
+    #if defined(__linux__)
+        #include <unistd.h>
+        #include <sys/syscall.h>
+        #include <linux/futex.h>
+        #include <limits.h>
+    #endif
 #endif
 
 // 1 MB
@@ -646,8 +654,12 @@ struct sft_thread_payload {
 };
 
 struct sft_barrier {
+#ifdef _WIN32
     volatile i32 count, generation;
     i32 thread_count;
+#else
+    pthread_barrier_t b;
+#endif
 };
 
 #if defined(_WIN32)
@@ -657,6 +669,7 @@ struct sft_barrier {
 #else
     #include <pthread.h>
     #include <semaphore.h>
+    #include <errno.h>
     typedef pthread_t sft_thread;
     typedef sem_t sft_sem;
 #endif
@@ -2295,13 +2308,17 @@ static void sft__builder_reset(struct sft_meshlet_builder* builder) {
 }
 
 static void sft__barrier_init(struct sft_barrier* b, i32 thread_count) {
+#if defined(_WIN32)
     b->count = 0;
     b->generation = 0;
     b->thread_count = thread_count;
+#else
+    pthread_barrier_init(&b->b, NULL, thread_count);
+#endif
 }
 
-// TODO, IMPORTANT, update to have preprocessing for linux
 static SFT_INLINE void sft__barrier_wait(struct sft_barrier* b) {
+#if defined(_WIN32)
     const i32 local_gen = b->generation;
     const i32 arrived = sft_atomic_add(&b->count, 1) + 1;
     
@@ -2321,6 +2338,9 @@ static SFT_INLINE void sft__barrier_wait(struct sft_barrier* b) {
             WaitOnAddress((volatile PVOID)&b->generation, (PVOID)&local_gen, sizeof(i32), INFINITE);
         }
     }
+#else
+    pthread_barrier_wait(&b->b);
+#endif
 }
 
 static void sft__mesh_build(
@@ -3846,7 +3866,7 @@ SFT_INLINE void sft_sem_init(sft_sem* s, i32 init_count) {
     sem_init(s, 0, init_count);
 }
 SFT_INLINE void sft_sem_wait(sft_sem* s) {
-    sem_wait(s);
+    while (-1 == sem_wait(s) && EINTR == errno) {}
 }
 SFT_INLINE void sft_sem_post(sft_sem* s, i32 count) { 
     for (i32 i = 0; i < count; i += 1) sem_post(s); 
@@ -6627,7 +6647,12 @@ SFT_FUNC sft_model* sft_model_load_qsf(const char* path, sft_arena* arena) {
 ================================================================*/
 
 SFT_FUNC void sft_init(i32 width, i32 height, i32 requested_threads) {
-    SFT_CALLOC(sft_state, 1, struct sft_state);
+    // SFT_CALLOC(sft_state, 1, struct sft_state);
+    sft_state = (struct sft_state*)SFT_ALIGNED_ALLOC(sizeof(struct sft_state), 64);
+    if (!sft_state) {
+        SFT_ERR_EXIT("failed to allocate aligned sft_state\n");
+    }
+    memset(sft_state, 0, sizeof(struct sft_state));
 
     { // ---  initialize multithreading  ---
         if (requested_threads > 0) {
@@ -6656,7 +6681,7 @@ SFT_FUNC void sft_init(i32 width, i32 height, i32 requested_threads) {
         }
     
         SFT_PRINT("initialized %d worker threads and %d SIMD %s\n",
-            sft_state->thread_count, SFT_SIMD_WIDTH, (SFT_SIMD_WIDTH > 1) ? "lanes" : "lane");
+            sft_state->thread_count, SFT_SIMD_WIDTH, (SFT_SIMD_WIDTH > 1) ? "lanes" : "lane (scalar)");
     }
 
     { // ---  initialize arenas  ---
@@ -6800,7 +6825,7 @@ SFT_FUNC void sft_release(void) {
     SFT_PRINT("  clip:     %u KB\n", (u32)sft_state->clip_arena.committed_size / 1024);
     SFT_PRINT("  tex heap: %u KB\n", (u32)sft_state->tex_heap_arena.committed_size / 1024);
 
-    SFT_FREE(sft_state);
+    SFT_ALIGNED_FREE(sft_state);
 }
 
 SFT_FUNC void sft_present(void) {
@@ -6903,13 +6928,14 @@ SFT_FUNC void sft_set_camera(sftvec cam_pos, sftmat view, sftmat proj) {
     const vi32 abs_mask = sft_vi_set1(0x7FFFFFFF);
     for (i32 p = 0; p < 6; p += 1) {
         const f32 length = sqrtf(planes[p][0]*planes[p][0] + planes[p][1]*planes[p][1] + planes[p][2]*planes[p][2]);
-        sft_state->frustum.normal[p].x = sft_vf_set1(planes[p][0] / length);
-        sft_state->frustum.normal[p].y = sft_vf_set1(planes[p][1] / length);
-        sft_state->frustum.normal[p].z = sft_vf_set1(planes[p][2] / length);
+        const f32 inv_len = (length < SFT_EPSILON) ? SFT_EPSILON : 1.f / length;
+        sft_state->frustum.normal[p].x = sft_vf_set1(planes[p][0] * inv_len);
+        sft_state->frustum.normal[p].y = sft_vf_set1(planes[p][1] * inv_len);
+        sft_state->frustum.normal[p].z = sft_vf_set1(planes[p][2] * inv_len);
         sft_state->frustum.abs_normal[p].x = sft_vf_cast_vi32(sft_vi_and(sft_vi_cast_vf32(sft_state->frustum.normal[p].x), abs_mask));
         sft_state->frustum.abs_normal[p].y = sft_vf_cast_vi32(sft_vi_and(sft_vi_cast_vf32(sft_state->frustum.normal[p].y), abs_mask));
         sft_state->frustum.abs_normal[p].z = sft_vf_cast_vi32(sft_vi_and(sft_vi_cast_vf32(sft_state->frustum.normal[p].z), abs_mask));
-        sft_state->frustum.d[p] = sft_vf_set1(planes[p][3] / length);
+        sft_state->frustum.d[p] = sft_vf_set1(planes[p][3] * inv_len);
     }
 }
 
