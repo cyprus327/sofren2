@@ -762,11 +762,15 @@ SFT_FUNC void sft_release(void);
 SFT_FUNC void sft_present(void);
 SFT_FUNC void sft_frame_begin(void);
 SFT_FUNC void sft_frame_end(void);
+SFT_FUNC void sft_resize(i32 width, i32 height);
 
 // misc
 SFT_FUNC void sft_set_camera(sftvec cam_pos, sftmat view, sftmat proj);
 SFT_FUNC void sft_set_debug_mode(i32 mode); // accepts SFT_DEBUG_[mode]
 SFT_FUNC const char* sft_get_debug_name(i32 mode);
+SFT_FUNC void sft_set_clear(u8 enabled); // clear background while resolving w/o one big memset
+SFT_FUNC void sft_set_clear_color(u32 color);
+SFT_FUNC void sft_set_color_buffer(u32* buf, i32 pitch_in_bytes);
 
 // drawing functions
 SFT_FUNC void sft_draw_instance(const sft_instance* instance);
@@ -778,6 +782,7 @@ SFT_FUNC void sft_draw_directional_light(sftvec dir, f32 r, f32 g, f32 b, f32 in
 SFT_FUNC void sft_draw_point_light(sftvec pos, f32 r, f32 g, f32 b, f32 intensity, f32 radius, u32 light_id);
 SFT_FUNC void sft_set_shadows_enabled(u8 enabled);
 SFT_FUNC void sft_invalidate_shadows(void);
+SFT_FUNC void sft_set_lightmap_brightness(f32 b);
 
 // texture functions
 #ifdef SFT_USE_STB_IMAGE
@@ -998,8 +1003,6 @@ typedef struct sft_point_light {
     sftvec color;       // RGB [0.0, 1.0], pre multiplied by intensity
     f32 radius;         // used for tile frustum culling
     f32 inv_radius_sqr; // 1.f / (radius * radius), for attenuation
-    u8 is_dirty;        // true when light initialized, moved, radius changed, geometry moves near light
-    i32 bitmask_ind;    // specific bit this light modifies in the cascade bitmasks, -1 if not casting shadows
 } sft_point_light;
 
 struct sft_atomic_counter {
@@ -1056,11 +1059,6 @@ struct sft_geom_job {
     u32 meshlet_count;
 };
 
-struct sft_shadow_grid_job {
-    u16 cascade_ind;
-    i32 block[3];       // coords of this block
-};
-
 struct sft_clipped_triangle {
     f32 sx[3], sy[3];
     f32 inv_w[3];
@@ -1096,29 +1094,6 @@ struct sft_tex_heap_node {
     struct sft_tex_heap_node* next;
 };
 
-struct sft_shadow_cascade {
-    i32 res;                // number of voxels along one axis, should be power of two
-    f32 voxel_size;         // size of a single voxel in world units
-    f32 half_world_size;    // res * voxel_size * 0.5
-
-    // coord of the camera in voxel space
-    i32 curr_grid_offset[3];
-    i32 prev_grid_offset[3]; // to calculate delta vector
-
-    // size = res^3, bitmasks storing visibility of up to 64 lights
-    u64* voxel_data;
-};
-
-struct sft_persistent_light {
-    u32 user_light_id;  // unique ID provided by the user
-    i32 bitmask_ind;    // which bit this light owns in the u64
-    u8 seen_this_frame; // used for garbage collection at the end of the frame
-
-    // cached state to detect if the user moved or resized the light
-    sftvec cached_pos;
-    f32 cached_radius;
-};
-
 
 /*================================================================
 :: PRIVATE VARIABLES
@@ -1137,7 +1112,7 @@ static struct sft_state {
     sft_arena clip_arena;
     sft_arena tex_heap_arena;
     sft_arena light_arena;
-    sft_arena grid_arena;
+    sft_arena shadow_arena;
 
     struct {
         // pointers to virtual reservations
@@ -1216,30 +1191,13 @@ static struct sft_state {
         sft_point_light* point;
         struct sft_atomic_counter directional_count;
         struct sft_atomic_counter point_count;
+
+        f32 lightmap_brightness;
     } lighting;
 
     struct {
-        // [0] is highest resolution (closest to camera)
-        struct sft_shadow_cascade cascades[4];
-
-        // 1 => slot is free, 0 => slot taken
-        u64 free_light_bits;
-
-        // to track active shadow casting lights
-        struct sft_persistent_light persistent_lights[64];
-
-        // spatial job queue
-        struct sft_shadow_grid_job* shadow_jobs;
-        struct sft_atomic_counter shadow_job_count;
-        struct sft_atomic_counter next_shadow_job_ind;
-
-        // queue to hold 8x8x8 jobs for newly exposed areas
-        struct sft_shadow_grid_job* wrapped_jobs;
-        i32 wrapped_job_count, wrapped_job_cap;
-        struct sft_atomic_counter next_wrapped_job_ind;
-
         u8 enabled;
-    } shadow_grid;
+    } shadows;
 
     struct sft_frustum frustum;
     
@@ -1249,6 +1207,7 @@ static struct sft_state {
 
         i32 tile_cols, tile_rows;
         u32* color_buffer;
+        i32 color_pitch;
 
         struct sft_payload_chunk* chunk_pool;
 
@@ -1256,6 +1215,9 @@ static struct sft_state {
         volatile i32* tile_tails;
         i32* tile_payload_counts; // global heuristic counter
         i32* sorted_tiles;
+
+        u8 should_clear;
+        u32 clear_color;
 
         enum sft_debug_mode debug_mode;
     } display;
@@ -2644,136 +2606,6 @@ static void sft__mesh_build(
     free(in_frontier);
 }
 
-static void sft__queue_new_cells(struct sft_shadow_cascade* cascade, u16 cascade_ind, i32 min[3], i32 max[3]) {
-    // clear old garbage memory on the main thread
-    for (i32 z = min[2]; z < max[2]; z += 1) {
-        for (i32 y = min[1]; y < max[1]; y += 1) {
-            for (i32 x = min[0]; x < max[0]; x += 1) {
-                const i32 flat_ind = sft__get_toroidal_ind(cascade->res, x, y, z);
-                cascade->voxel_data[flat_ind] = 0xFFFFFFFFFFFFFFFFull;
-            }
-        }
-    }
-
-    // align the bounding box to 8x8x8 grids
-    i32 align_min[3], align_max[3];
-    for (i32 i = 0; i < 3; i += 1) {
-        align_min[i] = (min[i] >= 0) ? (min[i] / 8) * 8 : ((min[i] - 7) / 8) * 8;
-        align_max[i] = (max[i] >= 0) ? ((max[i] + 7) / 8) * 8 : (max[i] / 8) * 8;
-    }
-
-    // dispatch the blocks as jobs
-    for (i32 z = align_min[2]; z < align_max[2]; z += 8) {
-        for (i32 y = align_min[1]; y < align_max[1]; y += 8) {
-            for (i32 x = align_min[0]; x < align_max[0]; x += 8) {
-                const i32 q_ind = sft_state->shadow_grid.wrapped_job_count;
-                if (q_ind < sft_state->shadow_grid.wrapped_job_cap) {
-                    sft_state->shadow_grid.wrapped_jobs[q_ind].cascade_ind = cascade_ind;
-                    sft_state->shadow_grid.wrapped_jobs[q_ind].block[0] = x;
-                    sft_state->shadow_grid.wrapped_jobs[q_ind].block[1] = y;
-                    sft_state->shadow_grid.wrapped_jobs[q_ind].block[2] = z;
-                    sft_state->shadow_grid.wrapped_job_count += 1;
-                }
-            }
-        }
-    }
-}
-
-static void sft__update_cascade_offsets(sftvec cam_world_pos) {
-    for (i32 i = 0; i < SFT_ARRLEN(sft_state->shadow_grid.cascades); i += 1) {
-        struct sft_shadow_cascade* c = &sft_state->shadow_grid.cascades[i];
-
-        // prev = curr
-        memcpy(c->prev_grid_offset, c->curr_grid_offset, sizeof(c->prev_grid_offset));
-
-        // new absolute discrete grid coord
-        c->curr_grid_offset[0] = floorf(cam_world_pos.x / c->voxel_size);
-        c->curr_grid_offset[1] = floorf(cam_world_pos.y / c->voxel_size);
-        c->curr_grid_offset[2] = floorf(cam_world_pos.z / c->voxel_size);
-
-        const i32 delta[3] = {
-            c->curr_grid_offset[0] - c->prev_grid_offset[0],
-            c->curr_grid_offset[1] - c->prev_grid_offset[1],
-            c->curr_grid_offset[2] - c->prev_grid_offset[2]
-        };
-        if (0 == delta[0] && 0 == delta[1] && 0 == delta[2]) {
-            // if the camera didn't cross a boundary, cache completely valid
-            continue;
-        }
-
-        // handle massive teleports (clear everything)
-        if (abs(delta[0]) >= c->res || abs(delta[1]) >= c->res || abs(delta[2]) >= c->res) {
-            memset(c->voxel_data, 0, c->res * c->res * c->res * sizeof(u64));
-
-            // flag all lights dirty
-            const i32 total_lights = sft_state->lighting.point_count.count;
-            for (i32 l = 0; l < total_lights; l += 1) {
-                sft_point_light* light = &sft_state->lighting.point[l];
-
-                // only dirty lights that are actively participating int he shadow grid
-                if (SFT_INVALID_BITMASK_IND != light->bitmask_ind) {
-                    light->is_dirty = 1;
-                }
-            }
-
-            continue;
-        }
-
-        // partial shift, calculate new min/max abs grid coords for this frame
-        const i32 half = c->res / 2;
-        i32 curr_min[3], curr_max[3], prev_min[3], prev_max[3];
-        for (i32 i = 0; i < 3; i += 1) {
-            curr_min[i] = c->curr_grid_offset[i] - half;
-            curr_max[i] = c->curr_grid_offset[i] + half;
-            prev_min[i] = c->prev_grid_offset[i] - half;
-            prev_max[i] = c->prev_grid_offset[i] + half;
-        }
-
-        // 3 slab update, update 3D sub region that is newly exposed
-
-        // slab 1, X axis slice
-        if (0 != delta[0]) {
-            i32 start, end;
-            if (delta[0] > 0) {
-                start = prev_max[0], end = curr_max[0];
-            }
-            else {
-                start = curr_min[0], end = prev_min[0];
-            }
-            sft__queue_new_cells(c, i, (i32[3]){start, curr_min[1], curr_min[2]}, (i32[3]){end, curr_max[1], curr_max[2]});
-        }
-
-        const i32 inter_min_x = SFT_MAX(curr_min[0], prev_min[0]);
-        const i32 inter_max_x = SFT_MIN(curr_max[0], prev_max[0]);
-        const i32 inter_min_y = SFT_MAX(curr_min[1], prev_min[1]);
-        const i32 inter_max_y = SFT_MIN(curr_max[1], prev_max[1]);
-
-        // slab 2, Y axis slice
-        if (0 != delta[1]) {
-            i32 start, end;
-            if (delta[1] > 0) {
-                start = prev_max[1], end = curr_max[1];
-            }
-            else {
-                start = curr_min[1], end = prev_min[1];
-            }
-            sft__queue_new_cells(c, i, (i32[3]){inter_min_x, start, curr_min[2]}, (i32[3]){inter_max_x, end, curr_max[2]});
-        }
-
-        // slab 3, Z axis slice
-        if (0 != delta[2]) {
-            i32 start, end;
-            if (delta[2] > 0) {
-                start = prev_max[2], end = curr_max[2];
-            }
-            else {
-                start = curr_min[2], end = prev_min[2];
-            }
-            sft__queue_new_cells(c, i, (i32[3]){inter_min_x, inter_min_y, start}, (i32[3]){inter_max_x, inter_max_y, end});
-        }
-    }
-}
-
 static SFT_INLINE f32 sft__build_item_axis_value(const struct sft_blas_build_item* item, i32 axis) {
     switch (axis) {
         case 0: return item->centroid.x;
@@ -3471,13 +3303,6 @@ static SFT_INLINE vf32 sft__trace_shadow_packet(
             const vf32 local_t_max = sft_vv_length(local_L);
             const sftvvec local_dir = sft_vv_norm_fast(local_L);
 
-            // precompute AABB inverse direction for the slab test
-            const vf32 v_ray_eps = sft_vf_set1(SFT_EPSILON);
-            sftvvec inv_local_dir;
-            inv_local_dir.x = sft_vf_rcp_refined(sft_vf_add(local_dir.x, v_ray_eps));
-            inv_local_dir.y = sft_vf_rcp_refined(sft_vf_add(local_dir.y, v_ray_eps));
-            inv_local_dir.z = sft_vf_rcp_refined(sft_vf_add(local_dir.z, v_ray_eps));
-
             // ---  BLAS traversal (model space)  ---
             u32 blas_stack[64];
             i32 blas_top = 0;
@@ -3918,267 +3743,6 @@ SFT_INLINE i32 sft_atomic_exchange(volatile i32* ptr, i32 new_val) {
             return old_val;
         }
         old_val = actual; // retry with the updated tail
-    }
-}
-
-static SFT_INLINE vf32 sft__sample_shadow(
-    const struct sft_shadow_cascade* cascade,
-    sftvvec world_pos, sftvvec normal, i32 light_bit_ind
-) {
-const vf32 v_voxel_size = sft_vf_set1(cascade->voxel_size);
-    const vf32 v_inv_voxel_size = sft_vf_rcp_refined(v_voxel_size);
-    const vf32 v_bias = sft_vf_set1(cascade->voxel_size * 0.6f);
-    const vf32 v_half = sft_vf_set1(0.5f);
-
-    sftvvec biased_pos;
-    biased_pos.x = sft_vf_fmadd(normal.x, v_bias, world_pos.x);
-    biased_pos.y = sft_vf_fmadd(normal.y, v_bias, world_pos.y);
-    biased_pos.z = sft_vf_fmadd(normal.z, v_bias, world_pos.z);
-
-    const vf32 fx = sft_vf_sub(sft_vf_mul(biased_pos.x, v_inv_voxel_size), v_half);
-    const vf32 fy = sft_vf_sub(sft_vf_mul(biased_pos.y, v_inv_voxel_size), v_half);
-    const vf32 fz = sft_vf_sub(sft_vf_mul(biased_pos.z, v_inv_voxel_size), v_half);
-
-    const vf32 floor_x = sft_vf_floor(fx);
-    const vf32 floor_y = sft_vf_floor(fy);
-    const vf32 floor_z = sft_vf_floor(fz);
-
-    const vi32 x0 = sft_vi_cvttps_epi32(floor_x);
-    const vi32 y0 = sft_vi_cvttps_epi32(floor_y);
-    const vi32 z0 = sft_vi_cvttps_epi32(floor_z);
-
-    const vi32 v_one_i = sft_vi_set1(1);
-    const vi32 x1 = sft_vi_add(x0, v_one_i);
-    const vi32 y1 = sft_vi_add(y0, v_one_i);
-    const vi32 z1 = sft_vi_add(z0, v_one_i);
-
-    const vf32 tx = sft_vf_sub(fx, floor_x);
-    const vf32 ty = sft_vf_sub(fy, floor_y);
-    const vf32 tz = sft_vf_sub(fz, floor_z);
-
-    const vi32 res_mask = sft_vi_set1(cascade->res - 1);
-    const vi32 wx0 = sft_vi_and(x0, res_mask);
-    const vi32 wy0 = sft_vi_and(y0, res_mask);
-    const vi32 wz0 = sft_vi_and(z0, res_mask);
-    const vi32 wx1 = sft_vi_and(x1, res_mask);
-    const vi32 wy1 = sft_vi_and(y1, res_mask);
-    const vi32 wz1 = sft_vi_and(z1, res_mask);
-
-    const vi32 res_y = sft_vi_set1(cascade->res);
-    const vi32 res_z = sft_vi_set1(cascade->res * cascade->res);
-
-    #define CALC_IND(x, y, z) sft_vi_add(sft_vi_mullo(z, res_z), sft_vi_add(sft_vi_mullo(y, res_y), x))
-
-    const vi32 i000 = CALC_IND(wx0, wy0, wz0);
-    const vi32 i100 = CALC_IND(wx1, wy0, wz0);
-    const vi32 i010 = CALC_IND(wx0, wy1, wz0);
-    const vi32 i110 = CALC_IND(wx1, wy1, wz0);
-    const vi32 i001 = CALC_IND(wx0, wy0, wz1);
-    const vi32 i101 = CALC_IND(wx1, wy0, wz1);
-    const vi32 i011 = CALC_IND(wx0, wy1, wz1);
-    const vi32 i111 = CALC_IND(wx1, wy1, wz1);
-
-    #undef CALC_IND
-
-    const u32* grid_u32 = (const u32*)cascade->voxel_data;
-    const i32 bit_shift = light_bit_ind & 31;
-    const i32 u32_offset = (light_bit_ind >= 32) ? 1 : 0;
-    const vi32 v_u32_offset = sft_vi_set1(u32_offset);
-    const vi32 v_test_bit = sft_vi_set1(1U << bit_shift);
-    const vf32 v_one_f = sft_vf_set1(1.f);
-    const vf32 v_zero_f = sft_vf_setzero();
-
-    #define GATHER_BIT(ind) \
-        sft_vf_blendv(v_one_f, v_zero_f, sft_vf_cast_vi32(sft_vi_cmp_eq( \
-            sft_vi_and( \
-                sft_vi_gather((const i32*)grid_u32, sft_vi_add(sft_vi_slli(ind, 1), v_u32_offset)), \
-                v_test_bit \
-            ), v_test_bit)))
-
-    const vf32 v000 = GATHER_BIT(i000);
-    const vf32 v100 = GATHER_BIT(i100);
-    const vf32 v010 = GATHER_BIT(i010);
-    const vf32 v110 = GATHER_BIT(i110);
-    const vf32 v001 = GATHER_BIT(i001);
-    const vf32 v101 = GATHER_BIT(i101);
-    const vf32 v011 = GATHER_BIT(i011);
-    const vf32 v111 = GATHER_BIT(i111);
-
-    #undef GATHER_BIT
-
-    #define SIMD_LERP(a, b, t) sft_vf_fmadd(t, sft_vf_sub(b, a), a)
-
-    const vf32 c00 = SIMD_LERP(v000, v100, tx);
-    const vf32 c10 = SIMD_LERP(v010, v110, tx);
-    const vf32 c01 = SIMD_LERP(v001, v101, tx);
-    const vf32 c11 = SIMD_LERP(v011, v111, tx);
-
-    const vf32 c0 = SIMD_LERP(c00, c10, ty);
-    const vf32 c1 = SIMD_LERP(c01, c11, ty);
-
-    return SIMD_LERP(c0, c1, tz);
-
-    #undef SIMD_LERP
-}
- 
-static SFT_INLINE void sft__process_888_shadow_block(u16 cascade_ind, i32 base_dx, i32 base_dy, i32 base_dz, u8 test_all_lights) {
-    const struct sft_shadow_cascade* c = &sft_state->shadow_grid.cascades[cascade_ind];
-    const f32 v_size = c->voxel_size;
-
-    // strict active bounds
-    const i32 half_res = c->res / 2;
-    const i32 curr_min_x = c->curr_grid_offset[0] - half_res;
-    const i32 curr_max_x = c->curr_grid_offset[0] + half_res;
-    const i32 curr_min_y = c->curr_grid_offset[1] - half_res;
-    const i32 curr_max_y = c->curr_grid_offset[1] + half_res;
-    const i32 curr_min_z = c->curr_grid_offset[2] - half_res;
-    const i32 curr_max_z = c->curr_grid_offset[2] + half_res;
-
-    // ---  calculate block world AABB  ---
-    struct sft_aabb block_aabb;
-    block_aabb.min.x = (f32)base_dx * v_size;
-    block_aabb.min.y = (f32)base_dy * v_size;
-    block_aabb.min.z = (f32)base_dz * v_size;
-    block_aabb.max.x = (f32)(base_dx + 8) * v_size;
-    block_aabb.max.y = (f32)(base_dy + 8) * v_size;
-    block_aabb.max.z = (f32)(base_dz + 8) * v_size;
-
-    // ---  cull dirty lights  ---
-    u16 active_lights[64];
-    i32 active_light_count = 0;
-    for (i32 i = 0; i < sft_state->lighting.point_count.count; i += 1) {
-        const sft_point_light* light = &sft_state->lighting.point[i];
-        if (SFT_INVALID_BITMASK_IND == light->bitmask_ind) {
-            continue;
-        }
-        
-        // if testing all lights (wrapped cells) don't care if it's dirty,
-        // if testing static cells it must be dirty to be processed
-        if (!test_all_lights && !light->is_dirty) {
-            continue;
-        }
-
-        if (sft__aabb_vs_sphere(block_aabb.min, block_aabb.max, light->pos, light->radius)) {
-            active_lights[active_light_count++] = (u16)i;
-        }
-    }
-    
-    if (0 == active_light_count) {
-        return; // no dirty lights touch this block
-    }
-
-    // ---  prepare constants  ---
-    // need offsets to generate world positions inside the inner loop
-    #if 8 == SFT_SIMD_WIDTH
-        const f32 x_offsets_arr[8] = {0.f, 1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f};
-    #elif 4 == SFT_SIMD_WIDTH
-        const f32 x_offsets_arr[4] = {0.f, 1.f, 2.f, 3.f};
-    #else
-        const f32 x_offsets_arr[1] = {0.f};
-    #endif
-
-    const vf32 v_x_offsets = sft_vf_load(x_offsets_arr);
-    const vf32 v_voxel_size = sft_vf_set1(v_size);
-    const vf32 v_half_voxel = sft_vf_set1(v_size * 0.5f);
-
-    const vf32 v_all_active = sft_vf_cast_vi32(sft_vi_set1(0xFFFFFFFF));
-
-    // ---  process voxels  ---
-    for (i32 z = 0; z < 8; z += 1) {
-        const vf32 v_z_base = sft_vf_set1((f32)(base_dz + z));
-        for (i32 y = 0; y < 8; y += 1) {
-            const vf32 v_y_base = sft_vf_set1((f32)(base_dy + y));
-            for (i32 x = 0; x < 8; x += SFT_SIMD_WIDTH) {
-                const vf32 v_x_base = sft_vf_add(sft_vf_set1((f32)(base_dx + x)), v_x_offsets);
-
-                // world pos = (discrete_coord * voxel_size) + (voxel_size / 2)
-                sftvvec ray_origins;
-                ray_origins.x = sft_vf_fmadd(v_x_base, v_voxel_size, v_half_voxel);
-                ray_origins.y = sft_vf_fmadd(v_y_base, v_voxel_size, v_half_voxel);
-                ray_origins.z = sft_vf_fmadd(v_z_base, v_voxel_size, v_half_voxel);
-
-                // toroidal memory inds for these lanes
-                i32 mem_inds[SFT_SIMD_WIDTH];
-                for (i32 lane = 0; lane < SFT_SIMD_WIDTH; lane += 1) {
-                    mem_inds[lane] = sft__get_toroidal_ind(c->res, base_dx + x + lane, base_dy + y, base_dz + z);
-                }
-
-                // trace against all active lights, TODO optimize
-                for (i32 li = 0; li < active_light_count; li += 1) {
-                    const sft_point_light* l = &sft_state->lighting.point[active_lights[li]];
-                    const u64 l_bit = (1ULL << l->bitmask_ind);
-
-                    // build raw L vector (light_pos - ray_origin)
-                    sftvvec L;
-                    L.x = sft_vf_sub(sft_vf_set1(l->pos.x), ray_origins.x);
-                    L.y = sft_vf_sub(sft_vf_set1(l->pos.y), ray_origins.y);
-                    L.z = sft_vf_sub(sft_vf_set1(l->pos.z), ray_origins.z);
-
-                    const vf32 shadowed = sft__trace_shadow_packet(
-                        ray_origins, L, v_all_active, l->pos, l->radius);
-                    
-                    const i32 shadow_mask = sft_vf_movemask(shadowed);
-
-                    // apply bits directly to the u64 arrays
-                    for (i32 lane = 0; lane < SFT_SIMD_WIDTH; lane += 1) {
-                        // prevent toroidal wrap-around overwrites
-                        const i32 gx = base_dx + x + lane;
-                        const i32 gy = base_dy + y;
-                        const i32 gz = base_dz + z;
-                        if (gx < curr_min_x || gx >= curr_max_x || 
-                            gy < curr_min_y || gy >= curr_max_y || 
-                            gz < curr_min_z || gz >= curr_max_z
-                        ) {
-                            continue; 
-                        }
-
-                        const i32 is_shadowed = shadow_mask & (1 << lane);
-                        const i32 mem_ind = mem_inds[lane];
-                        if (is_shadowed) {
-                            c->voxel_data[mem_ind] &= ~l_bit; 
-                        }
-                        else {
-                            c->voxel_data[mem_ind] |= l_bit; 
-                        }
-                    }
-                } 
-            }
-        }
-    }
-}
-
-static SFT_INLINE void sft__worker_process_shadow_block(const struct sft_shadow_grid_job* job) {
-    const struct sft_shadow_cascade* c = &sft_state->shadow_grid.cascades[job->cascade_ind];
-    const i32 half_res = c->res / 2;
-    
-    const i32 base_dx = c->curr_grid_offset[0] - half_res + (job->block[0] * 8);
-    const i32 base_dy = c->curr_grid_offset[1] - half_res + (job->block[1] * 8);
-    const i32 base_dz = c->curr_grid_offset[2] - half_res + (job->block[2] * 8);
-
-    sft__process_888_shadow_block(job->cascade_ind, base_dx, base_dy, base_dz, 0); // 0 => only dirty lights
-}
-
-static void sft__worker_phase_wrapped_cells(void) {
-    while (1) {
-        const i32 job_ind = sft_atomic_add(&sft_state->shadow_grid.next_wrapped_job_ind.count, 1);
-        if (job_ind >= sft_state->shadow_grid.wrapped_job_count) {
-            break;
-        }
-        
-        const struct sft_shadow_grid_job* job = &sft_state->shadow_grid.wrapped_jobs[job_ind];
-        
-        // 1 = test ALL lights, not just dirty ones, because the cell is brand new
-        sft__process_888_shadow_block(job->cascade_ind, job->block[0], job->block[1], job->block[2], 1);
-    }
-}
-
-static SFT_INLINE void sft__worker_phase_shadows(void) {
-    while (1) {
-        const i32 job_ind = sft_atomic_add(&sft_state->shadow_grid.next_shadow_job_ind.count, 1);
-        if (job_ind >= sft_state->shadow_grid.shadow_job_count.count) {
-            break;
-        }
-        sft__worker_process_shadow_block(&sft_state->shadow_grid.shadow_jobs[job_ind]);
     }
 }
 
@@ -5193,6 +4757,7 @@ static SFT_INLINE void sft__resolve_tile(
 ) {
     const i32 screen_w = (i32)(sft_state->display.half_width * 2.f);
     const i32 screen_h = (i32)(sft_state->display.half_height * 2.f);
+    const i32 pitch = sft_state->display.color_pitch;
 
     const i32 limit_x = SFT_MIN(tile_min_x + SFT_TILE_SIZE, screen_w);
     const i32 limit_y = SFT_MIN(tile_min_y + SFT_TILE_SIZE, screen_h);
@@ -5365,15 +4930,17 @@ static SFT_INLINE void sft__resolve_tile(
             
             i32 active_pixels = sft_vi_movemask(v_is_valid) & ((1 << SFT_SIMD_WIDTH) - 1);
 
-            // draw background, TODO maybe make optional
-            // i32 empty_mask = sft_vi_movemask(sft_vi_and(v_is_empty, v_in_bounds)) & ((1 << SFT_SIMD_WIDTH) - 1);
-            // while (empty_mask) {
-            //     const i32 lane = sft__tzcnt(empty_mask);
-            //     empty_mask &= (empty_mask - 1);
-            //     const i32 px = x + ix_offsets_arr[lane];
-            //     const i32 py = y + iy_offsets_arr[lane];
-            //     sft_state->display.color_buffer[py * screen_w + px] = 0xFFFF2222;
-            // }
+            // clear background
+            if (sft_state->display.should_clear) {
+                i32 empty_mask = sft_vi_movemask(sft_vi_and(v_is_empty, v_in_bounds)) & ((1 << SFT_SIMD_WIDTH) - 1);
+                while (empty_mask) {
+                    const i32 lane = sft__tzcnt(empty_mask);
+                    empty_mask &= (empty_mask - 1);
+                    const i32 px = x + ix_offsets_arr[lane];
+                    const i32 py = y + iy_offsets_arr[lane];
+                    sft_state->display.color_buffer[py * pitch + px] = sft_state->display.clear_color;
+                }
+            }
 
             if (0 == active_pixels) {
                 continue;
@@ -5544,22 +5111,7 @@ static SFT_INLINE void sft__resolve_tile(
                 };
                 
                 const sftvvec v_cam_to_pos = sft_vv_sub(v_cam_pos, interp_pos);
-                const vf32 v_depth_dist = sft_vv_length(v_cam_to_pos);
                 const sftvvec V = sft_vv_norm_fast(v_cam_to_pos);
-                
-                // ---  cascade selection  ---
-                alignas(32) f32 s_depths[SFT_SIMD_WIDTH];
-                sft_vf_store(s_depths, v_depth_dist);
-                
-                i32 selected_cascade = SFT_ARRLEN(sft_state->shadow_grid.cascades) - 1;
-                for (i32 c = 0; c < SFT_ARRLEN(sft_state->shadow_grid.cascades) - 1; c += 1) {
-                    const f32 safe_radius = sft_state->shadow_grid.cascades[c].half_world_size - sft_state->shadow_grid.cascades[c].voxel_size;
-                    if (s_depths[0] < safe_radius) {
-                        selected_cascade = c;
-                        break;
-                    }
-                }
-                const struct sft_shadow_cascade* active_cascade = &sft_state->shadow_grid.cascades[selected_cascade];
 
                 // ---  material lookup  ---
                 const u16 mesh_ind = inst->model->meshlet_mesh_inds[m_ind];
@@ -5715,56 +5267,7 @@ static SFT_INLINE void sft__resolve_tile(
                         // restrict the lit mask strictly to valid pixels
                         lit_mask = sft_vf_and(lit_mask, v_lane_mask);
 
-                        // ---  volumetric shadow grid  ---
-                        vf32 v_shadow_intensity;
-                        if (-1 == light->bitmask_ind || !sft_state->shadow_grid.enabled) {
-                            v_shadow_intensity = v_one;
-                        }
-                        else {
-                            // sample the primary selected cascade
-                            v_shadow_intensity = sft__sample_shadow(active_cascade, interp_pos, N, light->bitmask_ind);
-
-                            // if not in the absolute last cascade, check if there is a need to blend into the next one
-                            if (selected_cascade < SFT_ARRLEN(sft_state->shadow_grid.cascades) - 1) {
-                                const struct sft_shadow_cascade* next_cascade = &sft_state->shadow_grid.cascades[selected_cascade + 1];
-                                
-                                // start blending at 60% of the safe radius
-                                const f32 safe_radius = active_cascade->half_world_size - active_cascade->voxel_size;
-                                const f32 blend_start = safe_radius * 0.6f;
-                                const f32 blend_range = safe_radius - blend_start;
-                                
-                                const vf32 v_blend_start = sft_vf_set1(blend_start);
-                                const vf32 v_inv_blend_range = sft_vf_set1(1.f / blend_range);
-                                
-                                // calculate blend factor: clamp((depth - blend_start) / blend_range, 0.0, 1.0)
-                                vf32 v_blend = sft_vf_mul(sft_vf_sub(v_depth_dist, v_blend_start), v_inv_blend_range);
-                                v_blend = sft_vf_max(v_zero, sft_vf_min(v_blend, v_one));
-                                
-                                // if any of the lanes fall into the blend zone, sample the next cascade
-                                if (sft_vf_movemask(sft_vf_cmp_gt(v_blend, v_zero))) {
-                                    const vf32 v_shadow_next = sft__sample_shadow(next_cascade, interp_pos, N, light->bitmask_ind);
-                                    
-                                    // v_shadow_intensity = lerp(current, next, blend_factor)
-                                    v_shadow_intensity = sft_vf_fmadd(v_blend, sft_vf_sub(v_shadow_next, v_shadow_intensity), v_shadow_intensity);
-                                }
-                            }
-                            else {
-                                // in the final cascade. 
-                                // smoothly fade the shadow intensity to 1.0 (unshadowed) as the edge is approached
-                                const f32 safe_radius = active_cascade->half_world_size - active_cascade->voxel_size;
-                                const f32 blend_start = safe_radius * 0.6f;
-                                const f32 blend_range = safe_radius - blend_start;
-                                
-                                const vf32 v_blend_start = sft_vf_set1(blend_start);
-                                const vf32 v_inv_blend_range = sft_vf_set1(1.f / blend_range);
-                                
-                                // calculate blend factor: clamp((depth - blend_start) / blend_range, 0.0, 1.0)
-                                vf32 v_blend = sft_vf_mul(sft_vf_sub(v_depth_dist, v_blend_start), v_inv_blend_range);
-                                v_blend = sft_vf_max(v_zero, sft_vf_min(v_blend, v_one));
-                                
-                                v_shadow_intensity = sft_vf_fmadd(v_blend, sft_vf_sub(v_one, v_shadow_intensity), v_shadow_intensity);
-                            }
-                        }
+                        const vf32 v_shadow_intensity = v_one;
 
                         // ---  apply lighting  ---
                         const vf32 diff_intensity = sft_vf_mul(n_dot_l, attenuation);
@@ -5853,7 +5356,7 @@ static SFT_INLINE void sft__resolve_tile(
                     store_mask &= (store_mask - 1);
                     const i32 px = x + ix_offsets_arr[lane];
                     const i32 py = y + iy_offsets_arr[lane];
-                    sft_state->display.color_buffer[py * screen_w + px] = sft_vi_extract(v_color, lane);
+                    sft_state->display.color_buffer[py * pitch + px] = sft_vi_extract(v_color, lane);
                 }
             }
         }
@@ -5940,10 +5443,9 @@ static void sft__worker_thread(void* user_data) {
     while (1) {
         sft_sem_wait(&sft_state->sem_start);
 
-        // ---  shadow grid update pass  ---
-        if (sft_state->shadow_grid.enabled) {
-            sft__worker_phase_shadows();
-            sft__worker_phase_wrapped_cells();
+        // ---  shadow pass  ---
+        if (sft_state->shadows.enabled) {
+            // TODO add analytical point light shadow
             sft__barrier_wait(&sft_state->shadow_barrier);
         }
 
@@ -6810,66 +6312,7 @@ SFT_FUNC void sft_init(i32 width, i32 height, i32 requested_threads) {
         sft_state->lighting.directional = (sft_directional_light*)sft_state->light_arena.base;
         sft_state->lighting.point = (sft_point_light*)(sft_state->light_arena.base + (8ULL * 1024 * 1024));
 
-        sft_arena_init(&sft_state->grid_arena, 1024ULL * 1024 * 1024);
-        { // initialize shadow grid
-            sft_state->shadow_grid.free_light_bits = 0xFFFFFFFFFFFFFFFF;
-
-            struct sft_shadow_cascade* cascades = sft_state->shadow_grid.cascades;
-
-            cascades[0].res = 128;
-            cascades[0].voxel_size = 0.2f;
-            cascades[1].res = 64;
-            cascades[1].voxel_size = 0.8f;
-            cascades[2].res = 64;
-            cascades[2].voxel_size = 1.6f;
-            cascades[3].res = 128;
-            cascades[3].voxel_size = 2.4f;
-
-            for (i32 c = 0; c < SFT_ARRLEN(sft_state->shadow_grid.cascades); c += 1) {
-                struct sft_shadow_cascade* cascade = &sft_state->shadow_grid.cascades[c];
-                cascade->half_world_size = cascade->res * 0.5f * cascade->voxel_size;
-                
-                const i32 total_voxels = cascade->res * cascade->res * cascade->res;
-                cascade->voxel_data = sft_arena_alloc(&sft_state->grid_arena, total_voxels * sizeof(u64));
-                memset(cascade->voxel_data, 0xFF, total_voxels * sizeof(u64));
-
-                for (i32 n = 0; n < 3; n += 1) {
-                    cascade->curr_grid_offset[n] = cascade->prev_grid_offset[n] = 0;
-                }
-
-                sft_state->shadow_grid.wrapped_job_cap = 131072; // TODO maybe lower, 2MB is a lot
-                sft_state->shadow_grid.wrapped_jobs = sft_arena_alloc(&sft_state->grid_arena, sft_state->shadow_grid.wrapped_job_cap * sizeof(struct sft_shadow_grid_job));
-            }
-
-            // count total jobs
-            i32 total_jobs = 0;
-            for (i32 c = 0; c < SFT_ARRLEN(sft_state->shadow_grid.cascades); c += 1) {
-                const i32 blocks_per_axis = sft_state->shadow_grid.cascades[c].res / 8;
-                total_jobs += (blocks_per_axis * blocks_per_axis * blocks_per_axis);
-            }
-
-            // allocate and populate spatial jobs
-            sft_state->shadow_grid.shadow_jobs = sft_arena_alloc(&sft_state->grid_arena, total_jobs * sizeof(struct sft_shadow_grid_job));
-            
-            i32 job_ind = 0;
-            for (i32 c = 0; c < SFT_ARRLEN(sft_state->shadow_grid.cascades); c += 1) {
-                const i32 blocks_per_axis = sft_state->shadow_grid.cascades[c].res / 8;
-                for (i32 z = 0; z < blocks_per_axis; z += 1) {
-                    for (i32 y = 0; y < blocks_per_axis; y += 1) {
-                        for (i32 x = 0; x < blocks_per_axis; x += 1) {
-                            sft_state->shadow_grid.shadow_jobs[job_ind].cascade_ind = (u16)c;
-                            sft_state->shadow_grid.shadow_jobs[job_ind].block[0] = x;
-                            sft_state->shadow_grid.shadow_jobs[job_ind].block[1] = y;
-                            sft_state->shadow_grid.shadow_jobs[job_ind].block[2] = z;
-                            job_ind += 1;
-                        }
-                    }
-                }
-            }
-            sft_state->shadow_grid.shadow_job_count.count = job_ind;
-            
-            sft__barrier_init(&sft_state->shadow_barrier, sft_state->thread_count);
-        }
+        sft_arena_init(&sft_state->shadow_arena, 128ULL * 1024 * 1024);
     }
 
     { // ---  initialize display  ---
@@ -6885,14 +6328,13 @@ SFT_FUNC void sft_init(i32 width, i32 height, i32 requested_threads) {
         const i32 total_tiles = sft_state->display.tile_cols * sft_state->display.tile_rows;
 
         SFT_CALLOC(sft_state->thread_bin_states, sft_state->thread_count * total_tiles, struct sft_thread_bin_state);
-        SFT_CALLOC(sft_state->display.color_buffer, width * height, u32);
         SFT_CALLOC(sft_state->display.tile_heads, total_tiles, i32);
         SFT_CALLOC(sft_state->display.tile_tails, total_tiles, volatile i32);
         SFT_CALLOC(sft_state->display.tile_payload_counts, total_tiles, i32);
         SFT_CALLOC(sft_state->display.sorted_tiles, total_tiles, i32);
     }
 
-    { // ---  initialize default material  ---
+    { // ---  initialize default material and other defaults  ---
         // 256x256 checkerboard
         const i32 checker_w = 256;
         const i32 checker_h = 256;
@@ -6913,6 +6355,12 @@ SFT_FUNC void sft_init(i32 width, i32 height, i32 requested_threads) {
 
         // create the material
         sft_state->base_mat = sft_material_create(checker_tex, 0xFFFFFFFF, 2.f);
+
+        // default overbrightening
+        sft_state->lighting.lightmap_brightness = 1.5f;
+
+        // default background clear color
+        sft_state->display.clear_color = 0xFF222222;
     }
 }
 
@@ -6925,6 +6373,7 @@ SFT_FUNC void sft_release(void) {
     SFT_PRINT("  instance: %u KB\n", (u32)sft_state->instance_arena.committed_size / 1024);
     SFT_PRINT("  clip:     %u KB\n", (u32)sft_state->clip_arena.committed_size / 1024);
     SFT_PRINT("  tex heap: %u KB\n", (u32)sft_state->tex_heap_arena.committed_size / 1024);
+    SFT_PRINT("  shadows:  %u KB\n", (u32)sft_state->shadow_arena.committed_size / 1024);
 
     SFT_ALIGNED_FREE(sft_state);
 }
@@ -6952,9 +6401,6 @@ SFT_FUNC void sft_present(void) {
 
     // build the frame TLAS before workers start geometry processing
     sft__tlas_build();
-
-    // toroidal shift
-    sft__update_cascade_offsets(sft_state->camera_pos);
 
     // wake all worker threads to process the queue
     sft_sem_post(&sft_state->sem_start, sft_state->thread_count);
@@ -6984,27 +6430,37 @@ SFT_FUNC void sft_frame_end(void) {
     sft_state->mat_pool_transient.count = 0;
     sft_state->lighting.directional_count.count = 0;
     sft_state->lighting.point_count.count = 0;
-    sft_state->shadow_grid.wrapped_job_count = 0;
-    sft_state->shadow_grid.next_shadow_job_ind.count = 0;
-    sft_state->shadow_grid.next_wrapped_job_ind.count = 0;
+}
 
-    // garbage collect ghost lights
-    for (i32 i = 0; i < 64; i += 1) {
-        const u8 is_slot_taken = (0 == (sft_state->shadow_grid.free_light_bits & (1 << i)));
-        if (!is_slot_taken) {
-            continue;
-        }
-
-        struct sft_persistent_light* pls = sft_state->shadow_grid.persistent_lights;
-        if (pls[i].seen_this_frame) {
-            // reset for the next frame
-            pls[i].seen_this_frame = 0;
-        }
-        else {
-            // user didn't draw this light this frame, free the bit
-            sft_state->shadow_grid.free_light_bits |= (1ULL << i);
-        }
+SFT_FUNC void sft_resize(i32 width, i32 height) {
+    if (!sft_state) {
+        return;
     }
+
+    // update screen dimensions
+    sft_state->display.half_width = (f32)width * 0.5f;
+    sft_state->display.half_height = (f32)height * 0.5f;
+
+    // recalculate tile grid
+    sft_state->display.tile_cols = (width + SFT_TILE_SIZE - 1) / SFT_TILE_SIZE;
+    sft_state->display.tile_rows = (height + SFT_TILE_SIZE - 1) / SFT_TILE_SIZE;
+    const i32 total_tiles = sft_state->display.tile_cols * sft_state->display.tile_rows;
+
+    // ---  reallocate screen dependent and tile dependent buffers  ---
+    sft_state->thread_bin_states = (struct sft_thread_bin_state*)realloc(
+        sft_state->thread_bin_states, sft_state->thread_count * total_tiles * sizeof(struct sft_thread_bin_state));
+    
+    sft_state->display.tile_heads = (i32*)realloc(
+        sft_state->display.tile_heads, total_tiles * sizeof(i32));
+        
+    sft_state->display.tile_tails = (volatile i32*)realloc(
+        (void*)sft_state->display.tile_tails, total_tiles * sizeof(volatile i32));
+        
+    sft_state->display.tile_payload_counts = (i32*)realloc(
+        sft_state->display.tile_payload_counts, total_tiles * sizeof(i32));
+        
+    sft_state->display.sorted_tiles = (i32*)realloc(
+        sft_state->display.sorted_tiles, total_tiles * sizeof(i32));
 }
 
 SFT_FUNC void sft_set_camera(sftvec cam_pos, sftmat view, sftmat proj) {
@@ -7056,6 +6512,19 @@ SFT_FUNC const char* sft_get_debug_name(i32 mode) {
         case SFT_DEBUG_LIGHT_COUNT: return "Light Count";
         default: return "INVALID MODE";
     }
+}
+
+SFT_FUNC void sft_set_clear(u8 enabled) {
+    sft_state->display.should_clear = enabled;
+}
+
+SFT_FUNC void sft_set_clear_color(u32 color) {
+    sft_state->display.clear_color = color;
+}
+
+SFT_FUNC void sft_set_color_buffer(u32* buf, i32 pitch_in_bytes) {
+    sft_state->display.color_buffer = buf;
+    sft_state->display.color_pitch = pitch_in_bytes / sizeof(u32);
 }
 
 SFT_FUNC void sft_draw_instance(const sft_instance* inst) {
@@ -7114,56 +6583,7 @@ SFT_FUNC void sft_draw_directional_light(sftvec dir, f32 r, f32 g, f32 b, f32 in
 }
 
 SFT_FUNC void sft_draw_point_light(sftvec pos, f32 r, f32 g, f32 b, f32 intensity, f32 radius, u32 light_id) {
-    i32 assigned_bit_ind = -1;
-    u8 light_needs_grid_update = 0;
-
-    struct sft_persistent_light* pls = sft_state->shadow_grid.persistent_lights;
-
-    // try to find this light in persistent tracker
-    for (i32 i = 0; i < 64; i += 1) {
-        // if slot is valid (bit marked as taken)
-        const u8 is_slot_taken = (0 == (sft_state->shadow_grid.free_light_bits & (1ULL << i)));
-        
-        if (is_slot_taken && pls[i].user_light_id == light_id) {
-            assigned_bit_ind = i;
-            pls[i].seen_this_frame = 1;
-
-            // if the light moved or changed size since last frame
-            if (pos.x  != pls[i].cached_pos.x ||
-                pos.y  != pls[i].cached_pos.y ||
-                pos.z  != pls[i].cached_pos.z ||
-                radius != pls[i].cached_radius
-            ) {
-                light_needs_grid_update = 1;
-                pls[i].cached_pos = pos;
-                pls[i].cached_radius = radius;
-            }
-
-            break;
-        }
-    }
-
-    // if its a new light, allocate a bit for it
-    if (-1 == assigned_bit_ind) {
-        // find the lowest bit (1 => free)
-        if (0 == sft_state->shadow_grid.free_light_bits) {
-            SFT_ERR_RET(, "more than 64 shadow casting lights submitted\n");
-        }
-
-        // get ind of first available bit
-        assigned_bit_ind = sft__tzcnt(sft_state->shadow_grid.free_light_bits);
-
-        // mark the bit as taken (set to 0)
-        sft_state->shadow_grid.free_light_bits &= ~(1ULL << assigned_bit_ind);
-
-        // initialize persistent tracker
-        pls[assigned_bit_ind].user_light_id = light_id;
-        pls[assigned_bit_ind].seen_this_frame = 1;
-        pls[assigned_bit_ind].cached_pos = pos;
-        pls[assigned_bit_ind].cached_radius = radius;
-
-        light_needs_grid_update = 1;
-    }
+    (void)light_id; // unused for now
 
     // store the data in the array for the lighting pass
     const i32 slot = sft_atomic_add(&sft_state->lighting.point_count.count, 1);
@@ -7177,27 +6597,18 @@ SFT_FUNC void sft_draw_point_light(sftvec pos, f32 r, f32 g, f32 b, f32 intensit
     sft_state->lighting.point[slot].color.z = b * intensity;
     sft_state->lighting.point[slot].radius = radius;
     sft_state->lighting.point[slot].inv_radius_sqr = 1.f / (radius * radius);
-    sft_state->lighting.point[slot].bitmask_ind = assigned_bit_ind;
-    sft_state->lighting.point[slot].is_dirty = light_needs_grid_update;
 }
 
 SFT_FUNC void sft_set_shadows_enabled(u8 enabled) {
-    sft_state->shadow_grid.enabled = enabled;
+    sft_state->shadows.enabled = enabled;
 }
 
 SFT_FUNC void sft_invalidate_shadows(void) {
-    for (i32 c = 0; c < SFT_ARRLEN(sft_state->shadow_grid.cascades); c += 1) {
-        struct sft_shadow_cascade* cascade = &sft_state->shadow_grid.cascades[c];
-        const i32 total_voxels = cascade->res * cascade->res * cascade->res;
-        memset(cascade->voxel_data, 0xFF, total_voxels * sizeof(u64));
-    }
-    
-    // mark all lights as dirty
-    for (i32 i = 0; i < sft_state->lighting.point_count.count; i += 1) {
-        if (SFT_INVALID_BITMASK_IND != sft_state->lighting.point[i].bitmask_ind) {
-            sft_state->lighting.point[i].is_dirty = 1;
-        }
-    }
+    // unused for now
+}
+
+SFT_FUNC void sft_set_lightmap_brightness(f32 b) {
+    sft_state->lighting.lightmap_brightness = b;
 }
 
 #ifdef SFT_USE_STB_IMAGE
