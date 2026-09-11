@@ -70,6 +70,11 @@ enum sft_debug_mode {
     SFT_DEBUG_COUNT
 };
 
+enum sft_dmesh_type {
+    SFT_DMESH_QUADS,
+    SFT_DMESH_TRIANGLES
+};
+
 // public struct prototypes
 typedef struct sftvec   sftvec;
 typedef struct sftvvec  sftvvec;
@@ -82,6 +87,8 @@ typedef struct sft_arena sft_arena;
 
 typedef struct sft_mesh     sft_mesh;
 typedef struct sft_model    sft_model;
+typedef struct sft_dmesh    sft_dmesh;
+typedef struct sft_dmesh_qb sft_dmesh_qb;
 typedef struct sft_texture  sft_texture;
 typedef struct sft_material sft_material;
 typedef struct sft_instance sft_instance;
@@ -766,14 +773,24 @@ SFT_FUNC void sft_resize(i32 width, i32 height);
 
 // misc
 SFT_FUNC void sft_set_camera(sftvec cam_pos, sftmat view, sftmat proj);
-SFT_FUNC void sft_set_debug_mode(i32 mode); // accepts SFT_DEBUG_[mode]
-SFT_FUNC const char* sft_get_debug_name(i32 mode);
+SFT_FUNC void sft_set_debug_mode(enum sft_debug_mode mode);
+SFT_FUNC const char* sft_get_debug_name(enum sft_debug_mode mode);
 SFT_FUNC void sft_set_clear(u8 enabled); // clear background while resolving w/o one big memset
 SFT_FUNC void sft_set_clear_color(u32 color);
 SFT_FUNC void sft_set_color_buffer(u32* buf, i32 pitch_in_bytes);
 
 // drawing functions
 SFT_FUNC void sft_draw_instance(const sft_instance* instance);
+SFT_FUNC void sft_draw_cube(sft_dmesh* dm);
+SFT_FUNC void sft_draw_cube_inv(sft_dmesh* dm);
+SFT_FUNC void sft_draw_sphere(sft_dmesh* dm, i32 rings, i32 slices);
+SFT_FUNC void sft_draw_capsule(sft_dmesh* dm, sftvec start_pos, sftvec end_pos, f32 radius, i32 slices, i32 rings);
+SFT_FUNC void sft_draw_cylinder(sft_dmesh* dm, sftvec start_pos, sftvec end_pos, f32 start_radius, f32 end_radius, i32 sides);
+SFT_FUNC sft_dmesh* sft_dmesh_begin(enum sft_dmesh_type type, sft_mat_handle material, u32 max_prims);
+SFT_FUNC void sft_dmesh_push_quad(sft_dmesh* dm, sftvec p0, sftvec p1, sftvec p2, sftvec p3, f32 u0, f32 v0, f32 u1, f32 v1, sftvec normal);
+SFT_FUNC void sft_dmesh_push_tri(sft_dmesh* dm, sftvec p0, sftvec p1, sftvec p2, f32 u0, f32 v0, f32 u1, f32 v1, f32 u2, f32 v2, sftvec normal);
+SFT_FUNC u8   sft_dmesh_alloc_quads(sft_dmesh* dm, u32 count, sft_dmesh_qb* out_batch);
+SFT_FUNC void sft_dmesh_end(sft_dmesh* dm, const sftmat* opt_transform);
 
 // light functions
 SFT_FUNC void sft_set_ambient_light(f32 r, f32 g, f32 b);
@@ -963,6 +980,50 @@ typedef struct sft_model {
     sft_tex_handle* lightmaps;
     u32 lightmap_count;
 } sft_model;
+
+typedef struct sft_dmesh {
+    enum sft_dmesh_type type;
+    sft_mat_handle material;
+    
+    // allocated from scratch_arena
+    struct sft_meshlet* meshlets;
+    struct sft_meshlet_attribs* attribs;
+    struct sft_meshlet_inds* inds; // static template
+    
+    // bounding spheres
+    f32* bounds_center_x;
+    f32* bounds_center_y;
+    f32* bounds_center_z;
+    f32* bounds_radius;
+    
+    // bounding AABBs
+    f32* bounds_min_x;
+    f32* bounds_min_y;
+    f32* bounds_min_z;
+    f32* bounds_max_x;
+    f32* bounds_max_y;
+    f32* bounds_max_z;
+    
+    // cone culling (will be set to {0,0,1} and cutoff 2.f to disable culling)
+    f32* cone_axis_x;
+    f32* cone_axis_y;
+    f32* cone_axis_z;
+    f32* cone_cutoff;
+    
+    // state tracking
+    u32 max_meshlets;           // capacity
+    u32 curr_meshlet;        // which meshlet currently being written to
+    u32 curr_vert;           // verts written in the current meshlet
+    u32 max_verts_per_chunk;    // 64 for quads, 63 for triangles
+} sft_dmesh;
+
+typedef struct sft_dmesh_qb {
+    f32 *x, *y, *z;         // 64 float slices
+    f32 *nx, *ny, *nz;
+    f32 *u, *v;
+    u32 vert_offset;        // starting index within this batch (0, 4, 8... 60)
+    u32 allocated_count;    // track how many quads were actually reserved
+} sft_dmesh_qb;
 
 typedef struct sft_texture {
     u32* pixels;
@@ -1232,6 +1293,12 @@ static struct sft_state {
         struct sft_clipped_triangle* pool;
         volatile i32 count;
     } clip_cache;
+
+    struct {
+        // constant templates
+        struct sft_meshlet_inds quad_inds;
+        struct sft_meshlet_inds tri_inds;
+    } dmesh;
 
     sftvec camera_pos;
     sftmat view, proj;
@@ -1896,77 +1963,14 @@ static SFT_INLINE void sft__swizzle_rgba_to_argb(u32* pixels, i32 count) {
 
 static i32 sft__get_physical_core_count(void) {
 #if defined(_WIN32)
-    DWORD length = 0;
-    GetLogicalProcessorInformation(NULL, &length);
-    if (0 == length) {
-        return 1;
-    }
-
-    SYSTEM_LOGICAL_PROCESSOR_INFORMATION* buffer = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION*)malloc(length);
-    GetLogicalProcessorInformation(buffer, &length);
-
-    i32 physical_cores = 0;
-    i32 count = length / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION);
-    for (i32 i = 0; i < count; i += 1) {
-        if (RelationProcessorCore == buffer[i].Relationship) {
-            physical_cores += 1;
-        }
-    }
-
-    free(buffer);
-    return physical_cores > 0 ? physical_cores : 1;
-
-#elif defined(__linux__)
-    i32 physical_cores = 0;
-    
-    // gives the number of processors the OS is configured for
-    i32 max_cpus = sysconf(_SC_NPROCESSORS_CONF);
-    if (max_cpus < 1) {
-        max_cpus = 1;
-    }
-
-    // track seen physical cores based on their primary thread ID to avoid double counting
-    i32* seen;
-    SFT_CALLOC(seen, max_cpus, i32);
-    for (i32 i = 0; i < max_cpus; i += 1) {
-        char path[256];
-        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", i);
-        
-        FILE* f = fopen(path, "r");
-        if (f) {
-            i32 first_sibling = -1;
-            // thread_siblings_list is usually formatted as "0,4" or "0-3". 
-            // reading the first %d extracts the primary logical CPU ID 
-            // associated with this physical core
-            if (1 == fscanf(f, "%d", &first_sibling)) {
-                if (first_sibling >= 0 && first_sibling < max_cpus && 0 == seen[first_sibling]) {
-                    seen[first_sibling] = 1;
-                    physical_cores += 1;
-                }
-            }
-            fclose(f);
-        }
-    }
-    free(seen);
-
-    if (physical_cores > 0) {
-        return physical_cores;
-    }
-
-    // fallback if sysfs is unreadable (e.g., inside restricted containers/chroots)
-    const i32 logical_cores = sysconf(_SC_NPROCESSORS_ONLN);
-    return (logical_cores > 1) ? logical_cores / 2 : 1;
-
-#elif defined(__APPLE__)
-    #include <sys/sysctl.h>
-    i32 physical_cores = 1;
-    size_t size = sizeof(physical_cores);
-    sysctlbyname("hw.physicalcpu", &physical_cores, &size, NULL, 0);
-    return (physical_cores > 0) ? physical_cores : 1;
-
+    SYSTEM_INFO sysinfo;
+    GetSystemInfo(&sysinfo);
+    return sysinfo.dwNumberOfProcessors > 0 ? (i32)sysinfo.dwNumberOfProcessors : 1;
+#elif defined(__linux__) || defined(__APPLE__)
+    i32 cores = sysconf(_SC_NPROCESSORS_ONLN);
+    return cores > 0 ? cores : 1;
 #else
     return 1;
-
 #endif
 }
 
@@ -2606,6 +2610,75 @@ static void sft__mesh_build(
     free(in_frontier);
 }
 
+static void sft__dmesh_finalize_chunk(sft_dmesh* dm) {
+    if (0 == dm->curr_vert) {
+        return; // nothing to finalize
+    }
+
+    const u32 m_ind = dm->curr_meshlet;
+    if (m_ind >= dm->max_meshlets) {
+        return; // over allocation guard
+    }
+
+    struct sft_meshlet* m = &dm->meshlets[m_ind];
+    struct sft_meshlet_attribs* attr = &dm->attribs[m_ind];
+
+    // collapse trailing unused verts onto v0
+    // so template will generate zero area degen tris
+    for (u32 i = dm->curr_vert; i < SFT_VERTS_PER_MESHLET; i += 1) {
+        m->x[i] = m->x[0], m->y[i] = m->y[0], m->z[i] = m->z[0];
+        attr->nx[i] = attr->nx[0], attr->ny[i] = attr->ny[0], attr->nz[i] = attr->nz[0];
+        attr->u[i] = attr->u[0], attr->v[i] = attr->v[0];
+        attr->lu[i] = attr->lu[0], attr->lv[i] = attr->lv[0];
+    }
+
+    // calculate AABB
+    f32 min_x = 1e30f, max_x = -1e30f;
+    f32 min_y = 1e30f, max_y = -1e30f;
+    f32 min_z = 1e30f, max_z = -1e30f;
+    for (u32 i = 0; i < dm->curr_vert; i += 1) {
+        const f32 x = m->x[i], y = m->y[i], z = m->z[i];
+        if (x < min_x) min_x = x;
+        if (x > max_x) max_x = x;
+        if (y < min_y) min_y = y;
+        if (y > max_y) max_y = y;
+        if (z < min_z) min_z = z;
+        if (z > max_z) max_z = z;
+    }
+
+    // derive bounding spheres and write to arrays
+    const f32 cx = (min_x + max_x) * 0.5f;
+    const f32 cy = (min_y + max_y) * 0.5f;
+    const f32 cz = (min_z + max_z) * 0.5f;
+    const f32 dx = max_x - cx, dy = max_y - cy, dz = max_z - cz;
+    const f32 r = sqrtf(dx*dx + dy*dy + dz*dz);
+
+    dm->bounds_min_x[m_ind] = min_x, dm->bounds_max_x[m_ind] = max_x;
+    dm->bounds_min_y[m_ind] = min_y, dm->bounds_max_y[m_ind] = max_y;
+    dm->bounds_min_z[m_ind] = min_z, dm->bounds_max_z[m_ind] = max_z;
+
+    dm->bounds_center_x[m_ind] = cx;
+    dm->bounds_center_y[m_ind] = cy;
+    dm->bounds_center_z[m_ind] = cz;
+    dm->bounds_radius[m_ind] = r;
+
+    // bypass normal cone culling
+    dm->cone_axis_x[m_ind] = 0.f;
+    dm->cone_axis_y[m_ind] = 0.f;
+    dm->cone_axis_z[m_ind] = 1.f;
+    dm->cone_cutoff[m_ind] = 2.f; // > 1.0 => "dot <= threshold" always true
+
+    // copy template
+    const struct sft_meshlet_inds* template_inds = 
+        (SFT_DMESH_QUADS == dm->type) ? &sft_state->dmesh.quad_inds :
+        /*SFT_DMESH_TRIS == dm->type*/  &sft_state->dmesh.tri_inds;
+    memcpy(&dm->inds[m_ind], template_inds, sizeof(struct sft_meshlet_inds));
+
+    // advance tracking state
+    dm->curr_meshlet += 1;
+    dm->curr_vert = 0;
+}
+
 static SFT_INLINE f32 sft__build_item_axis_value(const struct sft_blas_build_item* item, i32 axis) {
     switch (axis) {
         case 0: return item->centroid.x;
@@ -2882,12 +2955,6 @@ static void sft__tlas_build(void) {
     const u32 inst_count = sft_state->cmd_queue.instance_count.count;
     if (0 == inst_count) {
         return;
-    }
-
-    // manually advance the scratch arena offset past the ss_cache to prevent geometry phase from overwriting TLAS nodes
-    const u64 ss_cache_size = sft_state->cmd_queue.total_ss_meshlets.count * sizeof(struct sft_ss_meshlet);
-    if (sft_state->scratch_arena.offset < ss_cache_size) {
-        sft_state->scratch_arena.offset = ss_cache_size;
     }
 
     struct sft_blas_build_item* items = (struct sft_blas_build_item*)
@@ -5683,6 +5750,7 @@ SFT_FUNC sft_model* sft_model_load_glb(const char* filename, sft_arena* arena, i
 
     // ---  allocate model  ---
     sft_model* model = (sft_model*)sft_arena_alloc(arena, sizeof(sft_model));
+    memset(model, 0, sizeof(sft_model));
     // maximum possible meshes is materials_count + 1 (for primitives with no material)
     model->meshes = (sft_mesh*)sft_arena_alloc(arena, (data->materials_count + 1) * sizeof(sft_mesh));
     u32 active_meshes = 0;
@@ -5835,6 +5903,7 @@ SFT_FUNC sft_model* sft_model_load_glb(const char* filename, sft_arena* arena, i
         // ---  build meshlets  ---
         sft_mesh* out_mesh = &model->meshes[active_meshes];
         out_mesh->material = curr_handle;
+        out_mesh->lightmap_page = 0xFFFFFFFF;
 
         i32 *vertex_offsets, *adjacency, *write_heads;
         SFT_CALLOC(vertex_offsets, total_verts + 1, i32);
@@ -6298,7 +6367,7 @@ SFT_FUNC void sft_init(i32 width, i32 height, i32 requested_threads) {
         sft_state->display.chunk_pool = (struct sft_payload_chunk*)sft_state->chunk_arena.base;
         
         sft_arena_init(&sft_state->scratch_arena, 2ULL * 1024 * 1024 * 1024);
-        sft_state->ss_cache = (struct sft_ss_meshlet*)sft_state->scratch_arena.base;
+        // sft_state->ss_cache = (struct sft_ss_meshlet*)sft_state->scratch_arena.base;
 
         sft_arena_init(&sft_state->clip_arena, 32ULL * 1024 * 1024);
         sft_state->clip_cache.pool = (struct sft_clipped_triangle*)sft_state->clip_arena.base;
@@ -6362,6 +6431,43 @@ SFT_FUNC void sft_init(i32 width, i32 height, i32 requested_threads) {
         // default background clear color
         sft_state->display.clear_color = 0xFF222222;
     }
+
+    { // ---  initialize dmesh templates  ---
+        memset(&sft_state->dmesh.quad_inds, 0, sizeof(struct sft_meshlet_inds));
+        memset(&sft_state->dmesh.tri_inds, 0, sizeof(struct sft_meshlet_inds));
+
+        const u32 batch_count = 128 / SFT_SIMD_WIDTH;
+
+        for (u32 tri = 0; tri < 128; tri += 1) {
+            const u32 batch = tri / SFT_SIMD_WIDTH;
+            const u32 lane  = tri % SFT_SIMD_WIDTH;
+            const u32 offset = batch * (SFT_SIMD_WIDTH * 4);
+
+            // quad template, 16 quads => 32 tris
+            if (tri < 32) {
+                const u32 q = tri / 2;
+                const u8 bv = (u8)(q * 4);
+
+                // tri 0: (0, 1, 2), tri 1: (0, 2, 3)
+                const u8 v0 = bv;
+                const u8 v1 = (0 == tri % 2) ? (bv + 1) : (bv + 2);
+                const u8 v2 = (0 == tri % 2) ? (bv + 2) : (bv + 3);
+
+                sft_state->dmesh.quad_inds.inds[offset + (0 * SFT_SIMD_WIDTH) + lane] = v0;
+                sft_state->dmesh.quad_inds.inds[offset + (1 * SFT_SIMD_WIDTH) + lane] = v1;
+                sft_state->dmesh.quad_inds.inds[offset + (2 * SFT_SIMD_WIDTH) + lane] = v2;
+            }
+
+            // tri template, 21 tris
+            if (tri < 21) {
+                const u8 bv = (u8)(tri * 3);
+
+                sft_state->dmesh.tri_inds.inds[offset + (0 * SFT_SIMD_WIDTH) + lane] = bv + 0;
+                sft_state->dmesh.tri_inds.inds[offset + (1 * SFT_SIMD_WIDTH) + lane] = bv + 1;
+                sft_state->dmesh.tri_inds.inds[offset + (2 * SFT_SIMD_WIDTH) + lane] = bv + 2;
+            }
+        }
+    }
 }
 
 SFT_FUNC void sft_release(void) {
@@ -6393,9 +6499,9 @@ SFT_FUNC void sft_present(void) {
     memset((void*)sft_state->display.tile_tails, 0xFF, total_tiles * sizeof(i32));
     memset(sft_state->display.tile_payload_counts, 0, total_tiles * sizeof(i32));
 
-    // exact fit bulk commit for the screen space cache
     if (sft_state->cmd_queue.total_ss_meshlets.count > 0) {
-        sft_arena_commit_if_needed(&sft_state->scratch_arena, 
+        sft_state->ss_cache = (struct sft_ss_meshlet*)sft_arena_alloc(
+            &sft_state->scratch_arena, 
             sft_state->cmd_queue.total_ss_meshlets.count * sizeof(struct sft_ss_meshlet));
     }
 
@@ -6496,14 +6602,14 @@ SFT_FUNC void sft_set_camera(sftvec cam_pos, sftmat view, sftmat proj) {
     }
 }
 
-SFT_FUNC void sft_set_debug_mode(i32 mode) {
+SFT_FUNC void sft_set_debug_mode(enum sft_debug_mode mode) {
     if (mode < 0 || mode >= SFT_DEBUG_COUNT) {
         SFT_ERR_RET(, "invalid debug mode '%d', expected [0, %d)\n", mode, SFT_DEBUG_COUNT);
     }
     sft_state->display.debug_mode = mode;
 }
 
-SFT_FUNC const char* sft_get_debug_name(i32 mode) {
+SFT_FUNC const char* sft_get_debug_name(enum sft_debug_mode mode) {
     switch (mode) {
         case SFT_DEBUG_NONE: return "None";
         case SFT_DEBUG_WIREFRAME: return "Wireframe";
@@ -6563,6 +6669,439 @@ SFT_FUNC void sft_draw_instance(const sft_instance* inst) {
             meshlets_remaining -= count;
         }
     }
+}
+
+SFT_FUNC void sft_draw_cube(sft_dmesh* dm) {
+    // bottom left, top left, top right, bottom right
+    // front face
+    sft_dmesh_push_quad(dm,
+        SFT_V(-0.5f,-0.5f,-0.5f), SFT_V(-0.5f, 0.5f,-0.5f), SFT_V( 0.5f, 0.5f,-0.5f), SFT_V( 0.5f,-0.5f,-0.5f), 
+        0.f,0.f, 1.f,1.f, SFT_V(0.f, 0.f, -1.f));
+    // right face
+    sft_dmesh_push_quad(dm,
+        SFT_V( 0.5f,-0.5f,-0.5f), SFT_V( 0.5f, 0.5f,-0.5f), SFT_V( 0.5f, 0.5f, 0.5f), SFT_V( 0.5f,-0.5f, 0.5f), 
+        0.f,0.f, 1.f,1.f, SFT_V(1.f, 0.f, 0.f));
+    // back face
+    sft_dmesh_push_quad(dm,
+        SFT_V( 0.5f,-0.5f, 0.5f), SFT_V( 0.5f, 0.5f, 0.5f), SFT_V(-0.5f, 0.5f, 0.5f), SFT_V(-0.5f,-0.5f, 0.5f), 
+        0.f,0.f, 1.f,1.f, SFT_V(0.f, 0.f, 1.f));
+    // left face
+    sft_dmesh_push_quad(dm,
+        SFT_V(-0.5f,-0.5f, 0.5f), SFT_V(-0.5f, 0.5f, 0.5f), SFT_V(-0.5f, 0.5f,-0.5f), SFT_V(-0.5f,-0.5f,-0.5f), 
+        0.f,0.f, 1.f,1.f, SFT_V(-1.f, 0.f, 0.f));
+    // top face
+    sft_dmesh_push_quad(dm,
+        SFT_V(-0.5f, 0.5f,-0.5f), SFT_V(-0.5f, 0.5f, 0.5f), SFT_V( 0.5f, 0.5f, 0.5f), SFT_V( 0.5f, 0.5f,-0.5f), 
+        0.f,0.f, 1.f,1.f, SFT_V(0.f, 1.f, 0.f));
+    // bottom face
+    sft_dmesh_push_quad(dm,
+        SFT_V( 0.5f,-0.5f, 0.5f), SFT_V(-0.5f,-0.5f, 0.5f), SFT_V(-0.5f,-0.5f,-0.5f), SFT_V( 0.5f,-0.5f,-0.5f), 
+        0.f,0.f, 1.f,1.f, SFT_V(0.f, -1.f, 0.f));
+}
+
+SFT_FUNC void sft_draw_cube_inv(sft_dmesh* dm) {
+    // top right, top left, bottom left, bottom right
+    sft_dmesh_push_quad(dm, 
+        SFT_V( 0.5f, 0.5f,-0.5f), SFT_V(-0.5f, 0.5f,-0.5f), SFT_V(-0.5f,-0.5f,-0.5f), SFT_V( 0.5f,-0.5f,-0.5f), 
+        0.f,0.f, 1.f,1.f, SFT_V(0.f, 0.f, 1.f));
+    sft_dmesh_push_quad(dm, 
+        SFT_V( 0.5f, 0.5f, 0.5f), SFT_V( 0.5f, 0.5f,-0.5f), SFT_V( 0.5f,-0.5f,-0.5f), SFT_V( 0.5f,-0.5f, 0.5f), 
+        0.f,0.f, 1.f,1.f, SFT_V(-1.f, 0.f, 0.f));
+    sft_dmesh_push_quad(dm, 
+        SFT_V(-0.5f, 0.5f, 0.5f), SFT_V( 0.5f, 0.5f, 0.5f), SFT_V( 0.5f,-0.5f, 0.5f), SFT_V(-0.5f,-0.5f, 0.5f), 
+        0.f,0.f, 1.f,1.f, SFT_V(0.f, 0.f, -1.f));
+    sft_dmesh_push_quad(dm, 
+        SFT_V(-0.5f, 0.5f,-0.5f), SFT_V(-0.5f, 0.5f, 0.5f), SFT_V(-0.5f,-0.5f, 0.5f), SFT_V(-0.5f,-0.5f,-0.5f), 
+        0.f,0.f, 1.f,1.f, SFT_V(1.f, 0.f, 0.f));
+    sft_dmesh_push_quad(dm, 
+        SFT_V( 0.5f, 0.5f, 0.5f), SFT_V(-0.5f, 0.5f, 0.5f), SFT_V(-0.5f, 0.5f,-0.5f), SFT_V( 0.5f, 0.5f,-0.5f), 
+        0.f,0.f, 1.f,1.f, SFT_V(0.f, -1.f, 0.f));
+    sft_dmesh_push_quad(dm, 
+        SFT_V(-0.5f,-0.5f,-0.5f), SFT_V(-0.5f,-0.5f, 0.5f), SFT_V( 0.5f,-0.5f, 0.5f), SFT_V( 0.5f,-0.5f,-0.5f), 
+        0.f,0.f, 1.f,1.f, SFT_V(0.f, 1.f, 0.f));
+}
+
+// essentially copied from raylib source: rmodels.c, DrawSphereEx
+SFT_FUNC void sft_draw_sphere(sft_dmesh* dm, i32 rings, i32 slices) {
+    // angle between latitudinal parallels
+    // const f32 ringAngle = DEG2RAD * (180.f / (rings + 1));
+    const f32 ring_angle = SFT_PI / (rings + 1);
+
+    // angle between longitudinal meridians
+    // const f32 sliceAngle = DEG2RAD * (360.f / (slices);
+    const f32 slice_angle = 2.f * SFT_PI / slices;
+
+    const f32 cos_ring = cosf(ring_angle);
+    const f32 sin_ring = sinf(ring_angle);
+    const f32 cos_slice = cosf(slice_angle);
+    const f32 sin_slice = sinf(slice_angle);
+
+    // required to store face vertices
+    sftvec verts[4] = {0};
+    verts[2] = SFT_V(0.f, 1.f, 0.f);
+    verts[3] = SFT_V(sin_ring, cos_ring, 0.f);
+
+    for (i32 i = 0; i <= rings; i += 1) {
+        for (i32 j = 0; j < slices; j += 1) {
+            verts[0] = verts[2];
+            verts[1] = verts[3];
+            // rotation matrix around y axis
+            verts[2] = SFT_V(cos_slice*verts[2].x - sin_slice*verts[2].z, verts[2].y, sin_slice*verts[2].x + cos_slice*verts[2].z);
+            verts[3] = SFT_V(cos_slice*verts[3].x - sin_slice*verts[3].z, verts[3].y, sin_slice*verts[3].x + cos_slice*verts[3].z);
+
+            // average of the 4 face verts points outwards from the origin
+            const sftvec face_center = sft_v_add(sft_v_add(verts[0], verts[1]), sft_v_add(verts[2], verts[3]));
+            const sftvec face_normal = sft_v_norm(face_center);
+
+            sft_dmesh_push_quad(dm, 
+                verts[0], verts[2], verts[3], verts[1], 
+                0.f, 0.f, 1.f, 1.f, 
+                face_normal);
+        }
+
+        // rotate around z axis to set up starting verts for next ring
+        verts[2] = verts[3];
+        // rotation matrix around z axis
+        verts[3] = SFT_V(cos_ring*verts[3].x + sin_ring*verts[3].y, -sin_ring*verts[3].x + cos_ring*verts[3].y, verts[3].z);
+    }
+}
+
+// essentially copied from raylib source: rmodels.c, DrawCapsule
+SFT_FUNC void sft_draw_capsule(sft_dmesh* dm, sftvec start_pos, sftvec end_pos, f32 radius, i32 slices, i32 rings) {
+    if (slices < 3) {
+        slices = 3;
+    }
+
+    sftvec dir = sft_v_sub(end_pos, start_pos);
+
+    // draw a sphere if start and end point are the same
+    const u8 sphere_case = (0.f == dir.x && 0.f == dir.y && 0.f == dir.z);
+    if (sphere_case) {
+        dir = SFT_V(0.f, 1.f, 0.f);
+    }
+
+    // construct a basic of the base and the caps
+    sftvec b0 = sft_v_norm(dir);
+    const sftvec b1 = sft_v_norm(sft_v_perpendicular(dir));
+    const sftvec b2 = sft_v_norm(sft_v_cross(b1, dir));
+    sftvec cap_center = end_pos;
+
+    const f32 base_slice_angle = 2.f * SFT_PI / slices;
+    const f32 base_ring_angle = 0.5f * SFT_PI / rings;
+
+    // render both caps
+    for (i32 c = 0; c < 2; c += 1) {
+        for (i32 i = 0; i < rings; i += 1) {
+            for (i32 j = 0; j < slices; j += 1) {
+                // building up the rings from capCenter in the direction of the 'dir' vector
+
+                // compute the four vertices
+                const f32 rS1 = sinf(base_slice_angle*(j + 0))*cosf(base_ring_angle*(i + 0));
+                const f32 rC1 = cosf(base_slice_angle*(j + 0))*cosf(base_ring_angle*(i + 0));
+                const sftvec w1 = SFT_V(
+                    cap_center.x + (sinf(base_ring_angle*(i + 0))*b0.x + rS1*b1.x + rC1*b2.x)*radius,
+                    cap_center.y + (sinf(base_ring_angle*(i + 0))*b0.y + rS1*b1.y + rC1*b2.y)*radius,
+                    cap_center.z + (sinf(base_ring_angle*(i + 0))*b0.z + rS1*b1.z + rC1*b2.z)*radius);
+
+                const f32 rS2 = sinf(base_slice_angle*(j + 1))*cosf(base_ring_angle*(i + 0));
+                const f32 rC2 = cosf(base_slice_angle*(j + 1))*cosf(base_ring_angle*(i + 0));
+                const sftvec w2 = SFT_V(
+                    cap_center.x + (sinf(base_ring_angle*(i + 0))*b0.x + rS2*b1.x + rC2*b2.x)*radius,
+                    cap_center.y + (sinf(base_ring_angle*(i + 0))*b0.y + rS2*b1.y + rC2*b2.y)*radius,
+                    cap_center.z + (sinf(base_ring_angle*(i + 0))*b0.z + rS2*b1.z + rC2*b2.z)*radius);
+
+                const f32 rS3 = sinf(base_slice_angle*(j + 0))*cosf(base_ring_angle*(i + 1));
+                const f32 rC3 = cosf(base_slice_angle*(j + 0))*cosf(base_ring_angle*(i + 1));
+                const sftvec w3 = SFT_V(
+                    cap_center.x + (sinf(base_ring_angle*(i + 1))*b0.x + rS3*b1.x + rC3*b2.x)*radius,
+                    cap_center.y + (sinf(base_ring_angle*(i + 1))*b0.y + rS3*b1.y + rC3*b2.y)*radius,
+                    cap_center.z + (sinf(base_ring_angle*(i + 1))*b0.z + rS3*b1.z + rC3*b2.z)*radius);
+
+                const f32 rS4 = sinf(base_slice_angle*(j + 1))*cosf(base_ring_angle*(i + 1));
+                const f32 rC4 = cosf(base_slice_angle*(j + 1))*cosf(base_ring_angle*(i + 1));
+                const sftvec w4 = SFT_V(
+                    cap_center.x + (sinf(base_ring_angle*(i + 1))*b0.x + rS4*b1.x + rC4*b2.x)*radius,
+                    cap_center.y + (sinf(base_ring_angle*(i + 1))*b0.y + rS4*b1.y + rC4*b2.y)*radius,
+                    cap_center.z + (sinf(base_ring_angle*(i + 1))*b0.z + rS4*b1.z + rC4*b2.z)*radius);
+
+                // average face position
+                const sftvec face_center = sft_v_mul(sft_v_add(sft_v_add(w1, w2), sft_v_add(w3, w4)), 0.25f);
+                
+                // normal is the direction from the hemisphere's origin to the face
+                const sftvec face_normal = sft_v_norm(sft_v_sub(face_center, cap_center));
+
+                // make sure cap triangle normals are facing outwards
+                if (0 == c) {
+                    sft_dmesh_push_quad(dm, w3, w1, w2, w4, 0.f, 0.f, 1.f, 1.f, face_normal);
+                } else {
+                    // reversed for the bottom cap
+                    sft_dmesh_push_quad(dm, w3, w4, w2, w1, 0.f, 0.f, 1.f, 1.f, face_normal);
+                }
+            }
+        }
+
+        cap_center = start_pos;
+        b0 = sft_v_mul(b0, -1.f);
+    }
+
+    // render middle
+    if (!sphere_case) {
+        for (int j = 0; j < slices; j += 1) {
+            // compute the four vertices
+            const f32 rS1 = sinf(base_slice_angle*(j + 0))*radius, rC1 = cosf(base_slice_angle*(j + 0))*radius;
+            const sftvec w1 = SFT_V(start_pos.x + rS1*b1.x + rC1*b2.x, start_pos.y + rS1*b1.y + rC1*b2.y, start_pos.z + rS1*b1.z + rC1*b2.z);
+
+            const f32 rS2 = sinf(base_slice_angle*(j + 1))*radius, rC2 = cosf(base_slice_angle*(j + 1))*radius;
+            const sftvec w2 = SFT_V(start_pos.x + rS2*b1.x + rC2*b2.x, start_pos.y + rS2*b1.y + rC2*b2.y, start_pos.z + rS2*b1.z + rC2*b2.z);
+
+            const f32 rS3 = sinf(base_slice_angle*(j + 0))*radius, rC3 = cosf(base_slice_angle*(j + 0))*radius;
+            const sftvec w3 = SFT_V(end_pos.x + rS3*b1.x + rC3*b2.x, end_pos.y + rS3*b1.y + rC3*b2.y, end_pos.z + rS3*b1.z + rC3*b2.z);
+
+            const f32 rS4 = sinf(base_slice_angle*(j + 1))*radius, rC4 = cosf(base_slice_angle*(j + 1))*radius;
+            const sftvec w4 = SFT_V(end_pos.x + rS4*b1.x + rC4*b2.x, end_pos.y + rS4*b1.y + rC4*b2.y, end_pos.z + rS4*b1.z + rC4*b2.z);
+
+            sft_dmesh_push_quad(dm, w3, w1, w2, w4, 0.f, 0.f, 1.f, 1.f, sft_v_face_normal(w3, w1, w2));
+        }
+    }
+}
+
+// essentially copied from raylib source: rmodels.c, DrawCylinderEx
+SFT_FUNC void sft_draw_cylinder(sft_dmesh* dm, sftvec start_pos, sftvec end_pos, f32 start_radius, f32 end_radius, i32 sides) {
+    if (sides < 3) {
+        sides = 3;
+    }
+
+    const sftvec dir = sft_v_sub(end_pos, start_pos);
+    if (0 == dir.x && 0 == dir.y && 0 == dir.z) {
+        return; // security check
+    }
+
+    // construct a basis of the base and the top faces
+    const sftvec b1 = sft_v_norm(sft_v_perpendicular(dir));
+    const sftvec b2 = sft_v_norm(sft_v_cross(b1, dir));
+
+    const f32 base_angle = (2.f * SFT_PI) / sides;
+
+    for (i32 i = 0; i < sides; i += 1) {
+        const f32 s1 = sinf(base_angle * (i + 0)) * start_radius, c1 = cosf(base_angle * (i + 0)) * start_radius;
+        const sftvec w1 = SFT_V(start_pos.x + s1*b1.x + c1*b2.x, start_pos.y + s1*b1.y + c1*b2.y, start_pos.z + s1*b1.z + c1*b2.z);
+            
+        const f32 s2 = sinf(base_angle * (i + 1)) * start_radius, c2 = cosf(base_angle * (i + 1)) * start_radius;
+        const sftvec w2 = SFT_V(start_pos.x + s2*b1.x + c2*b2.x, start_pos.y + s2*b1.y + c2*b2.y, start_pos.z + s2*b1.z + c2*b2.z);
+            
+        const f32 s3 = sinf(base_angle * (i + 0)) * end_radius, c3 = cosf(base_angle * (i + 0)) * end_radius;
+        const sftvec w3 = SFT_V(end_pos.x + s3*b1.x + c3*b2.x, end_pos.y + s3*b1.y + c3*b2.y, end_pos.z + s3*b1.z + c3*b2.z);
+            
+        const f32 s4 = sinf(base_angle * (i + 1)) * end_radius, c4 = cosf(base_angle * (i + 1)) * end_radius;
+        const sftvec w4 = SFT_V(end_pos.x + s4*b1.x + c4*b2.x, end_pos.y + s4*b1.y + c4*b2.y, end_pos.z + s4*b1.z + c4*b2.z);
+
+        if (start_radius > 0) {
+            sft_dmesh_push_quad(dm, start_pos, w2, w1, w1, 0.f, 0.f, 1.f, 1.f, sft_v_face_normal(start_pos, w2, w1));
+        }
+        
+        sft_dmesh_push_quad(dm, w3, w1, w2, w4, 0.f, 0.f, 1.f, 1.f, sft_v_face_normal(w3, w1, w2));
+        
+        if (end_radius > 0) {
+            sft_dmesh_push_quad(dm, end_pos, w3, w4, w4, 0.f, 0.f, 1.f, 1.f, sft_v_face_normal(end_pos, w3, w4));
+        }
+    }
+}
+
+SFT_FUNC sft_dmesh* sft_dmesh_begin(enum sft_dmesh_type type, sft_mat_handle material, u32 max_prims) {
+    if (0 == max_prims) {
+        return NULL;
+    }
+
+    const u32 max_verts_per_chunk = (SFT_DMESH_QUADS == type) ? 64 : 63;
+    const u32 verts_per_prim = (SFT_DMESH_QUADS == type) ? 4 : 3;
+    const u32 total_verts = max_prims * verts_per_prim;
+    const u32 max_meshlets =
+        (((total_verts + max_verts_per_chunk - 1) / max_verts_per_chunk) + SFT_SIMD_WIDTH - 1) & ~(SFT_SIMD_WIDTH - 1);
+
+    sft_dmesh* dm = (sft_dmesh*)sft_arena_alloc(&sft_state->scratch_arena, sizeof(sft_dmesh));
+    dm->type = type;
+    dm->material = material;
+    dm->max_meshlets = max_meshlets;
+    dm->curr_meshlet = 0;
+    dm->curr_vert = 0;
+    dm->max_verts_per_chunk = max_verts_per_chunk;
+
+    dm->meshlets = (struct sft_meshlet*)sft_arena_alloc(&sft_state->scratch_arena, max_meshlets * sizeof(struct sft_meshlet));
+    dm->attribs = (struct sft_meshlet_attribs*)sft_arena_alloc(&sft_state->scratch_arena, max_meshlets * sizeof(struct sft_meshlet_attribs));
+    dm->inds = (struct sft_meshlet_inds*)sft_arena_alloc(&sft_state->scratch_arena, max_meshlets * sizeof(struct sft_meshlet_inds));
+
+    dm->bounds_center_x = (f32*)sft_arena_alloc(&sft_state->scratch_arena, max_meshlets * sizeof(f32));
+    dm->bounds_center_y = (f32*)sft_arena_alloc(&sft_state->scratch_arena, max_meshlets * sizeof(f32));
+    dm->bounds_center_z = (f32*)sft_arena_alloc(&sft_state->scratch_arena, max_meshlets * sizeof(f32));
+    dm->bounds_radius   = (f32*)sft_arena_alloc(&sft_state->scratch_arena, max_meshlets * sizeof(f32));
+
+    dm->bounds_min_x = (f32*)sft_arena_alloc(&sft_state->scratch_arena, max_meshlets * sizeof(f32));
+    dm->bounds_min_y = (f32*)sft_arena_alloc(&sft_state->scratch_arena, max_meshlets * sizeof(f32));
+    dm->bounds_min_z = (f32*)sft_arena_alloc(&sft_state->scratch_arena, max_meshlets * sizeof(f32));
+    dm->bounds_max_x = (f32*)sft_arena_alloc(&sft_state->scratch_arena, max_meshlets * sizeof(f32));
+    dm->bounds_max_y = (f32*)sft_arena_alloc(&sft_state->scratch_arena, max_meshlets * sizeof(f32));
+    dm->bounds_max_z = (f32*)sft_arena_alloc(&sft_state->scratch_arena, max_meshlets * sizeof(f32));
+
+    dm->cone_axis_x = (f32*)sft_arena_alloc(&sft_state->scratch_arena, max_meshlets * sizeof(f32));
+    dm->cone_axis_y = (f32*)sft_arena_alloc(&sft_state->scratch_arena, max_meshlets * sizeof(f32));
+    dm->cone_axis_z = (f32*)sft_arena_alloc(&sft_state->scratch_arena, max_meshlets * sizeof(f32));
+    dm->cone_cutoff = (f32*)sft_arena_alloc(&sft_state->scratch_arena, max_meshlets * sizeof(f32));
+
+    return dm;
+}
+
+SFT_FUNC void sft_dmesh_push_quad(
+    sft_dmesh* dm,
+    sftvec p0, sftvec p1, sftvec p2, sftvec p3,
+    f32 u0, f32 v0, f32 u1, f32 v1,
+    sftvec normal
+) {
+    if (dm->curr_vert >= dm->max_verts_per_chunk) {
+        sft__dmesh_finalize_chunk(dm);
+    }
+    if (dm->curr_meshlet >= dm->max_meshlets) {
+        return; // prevent overflow
+    }
+
+    const u32 v = dm->curr_vert;
+    struct sft_meshlet* m = &dm->meshlets[dm->curr_meshlet];
+    struct sft_meshlet_attribs* attr = &dm->attribs[dm->curr_meshlet];
+
+    m->x[v + 0] = p0.x, m->y[v + 0] = p0.y, m->z[v + 0] = p0.z;
+    m->x[v + 1] = p1.x, m->y[v + 1] = p1.y, m->z[v + 1] = p1.z;
+    m->x[v + 2] = p2.x, m->y[v + 2] = p2.y, m->z[v + 2] = p2.z;
+    m->x[v + 3] = p3.x, m->y[v + 3] = p3.y, m->z[v + 3] = p3.z;
+
+    attr->u[v + 0] = u0, attr->v[v + 0] = v0;
+    attr->u[v + 1] = u1, attr->v[v + 1] = v0;
+    attr->u[v + 2] = u1, attr->v[v + 2] = v1;
+    attr->u[v + 3] = u0, attr->v[v + 3] = v1;
+
+    for (u32 i = 0; i < 4; i += 1) {
+        attr->nx[v + i] = normal.x, attr->ny[v + i] = normal.y, attr->nz[v + i] = normal.z;
+        attr->lu[v + i] = 0.f, attr->lv[v + i] = 0.f;
+    }
+
+    dm->curr_vert += 4;
+}
+
+SFT_FUNC void sft_dmesh_push_tri(
+    sft_dmesh* dm,
+    sftvec p0, sftvec p1, sftvec p2,
+    f32 u0, f32 v0, f32 u1, f32 v1, f32 u2, f32 v2,
+    sftvec normal
+) {
+    if (dm->curr_vert >= dm->max_verts_per_chunk) {
+        sft__dmesh_finalize_chunk(dm);
+    }
+    if (dm->curr_meshlet >= dm->max_meshlets) {
+        return; 
+    }
+
+    const u32 v = dm->curr_vert;
+    struct sft_meshlet* m = &dm->meshlets[dm->curr_meshlet];
+    struct sft_meshlet_attribs* attr = &dm->attribs[dm->curr_meshlet];
+
+    m->x[v + 0] = p0.x, m->y[v + 0] = p0.y, m->z[v + 0] = p0.z;
+    m->x[v + 1] = p1.x, m->y[v + 1] = p1.y, m->z[v + 1] = p1.z;
+    m->x[v + 2] = p2.x, m->y[v + 2] = p2.y, m->z[v + 2] = p2.z;
+
+    attr->u[v + 0] = u0, attr->v[v + 0] = v0;
+    attr->u[v + 1] = u1, attr->v[v + 1] = v1;
+    attr->u[v + 2] = u2, attr->v[v + 2] = v2;
+
+    for (u32 i = 0; i < 3; i += 1) {
+        attr->nx[v + i] = normal.x, attr->ny[v + i] = normal.y, attr->nz[v + i] = normal.z;
+        attr->lu[v + i] = 0.f, attr->lv[v + i] = 0.f;
+    }
+
+    dm->curr_vert += 3;
+}
+
+SFT_FUNC u8 sft_dmesh_alloc_quads(sft_dmesh* dm, u32 count, sft_dmesh_qb* out_batch) {
+    // max quads that fit in the active chunk
+    u32 space_remaining = (dm->max_verts_per_chunk - dm->curr_vert) / 4;
+    
+    if (0 == space_remaining) {
+        sft__dmesh_finalize_chunk(dm);
+        space_remaining = dm->max_verts_per_chunk / 4;
+    }
+    if (dm->curr_meshlet >= dm->max_meshlets) {
+        return 0;
+    }
+
+    const u32 allocation = (count < space_remaining) ? count : space_remaining;
+
+    struct sft_meshlet* m = &dm->meshlets[dm->curr_meshlet];
+    struct sft_meshlet_attribs* attr = &dm->attribs[dm->curr_meshlet];
+
+    out_batch->x = m->x, out_batch->y = m->y, out_batch->z = m->z;
+    out_batch->nx = attr->nx, out_batch->ny = attr->ny, out_batch->nz = attr->nz;
+    out_batch->u = attr->u, out_batch->v = attr->v;
+    out_batch->vert_offset = dm->curr_vert;
+    out_batch->allocated_count = allocation;
+
+    dm->curr_vert += allocation * 4;
+    return 1;
+}
+
+SFT_FUNC void sft_dmesh_end(sft_dmesh* dm, const sftmat* opt_transform) {
+    if (!dm) {
+        return;
+    }
+
+    // flush any pending geometry
+    if (dm->curr_vert > 0) {
+        sft__dmesh_finalize_chunk(dm);
+    }
+
+    if (0 == dm->curr_meshlet) {
+        return; // nothing drawn
+    }
+
+    sft_mesh* mesh = (sft_mesh*)sft_arena_alloc(&sft_state->scratch_arena, sizeof(sft_mesh));
+    memset(mesh, 0, sizeof(sft_mesh));
+    mesh->meshlets = dm->meshlets;
+    mesh->meshlet_attribs = dm->attribs;
+    mesh->inds = dm->inds;
+    mesh->meshlet_count = dm->curr_meshlet;
+    mesh->model_meshlet_offset = 0;
+    mesh->material = dm->material;
+    mesh->lightmap_page = 0xFFFFFFFF;
+    
+    mesh->bounds_center_x = dm->bounds_center_x;
+    mesh->bounds_center_y = dm->bounds_center_y;
+    mesh->bounds_center_z = dm->bounds_center_z;
+    mesh->bounds_radius = dm->bounds_radius;
+    mesh->bounds_min_x = dm->bounds_min_x;
+    mesh->bounds_min_y = dm->bounds_min_y;
+    mesh->bounds_min_z = dm->bounds_min_z;
+    mesh->bounds_max_x = dm->bounds_max_x;
+    mesh->bounds_max_y = dm->bounds_max_y;
+    mesh->bounds_max_z = dm->bounds_max_z;
+    
+    mesh->cone_axis_x = dm->cone_axis_x;
+    mesh->cone_axis_y = dm->cone_axis_y;
+    mesh->cone_axis_z = dm->cone_axis_z;
+    mesh->cone_cutoff = dm->cone_cutoff;
+
+    sft_model* model = (sft_model*)sft_arena_alloc(&sft_state->scratch_arena, sizeof(sft_model));
+    memset(model, 0, sizeof(sft_model));
+    model->meshes = mesh;
+    model->mesh_count = 1;
+    model->total_meshlets = dm->curr_meshlet;
+    model->blas_node_count = 0;
+    
+    model->meshlet_mesh_inds = (u16*)sft_arena_alloc(&sft_state->scratch_arena, dm->curr_meshlet * sizeof(u16));
+    memset(model->meshlet_mesh_inds, 0, dm->curr_meshlet * sizeof(u16));
+
+    sft_instance inst = {
+        .model = model,
+        .transform = opt_transform ? *opt_transform : SFT_MAT_IDENTITY,
+        .ss_meshlet_offset = 0
+    };
+
+    sft_draw_instance(&inst);
 }
 
 SFT_FUNC void sft_set_ambient_light(f32 r, f32 g, f32 b) {
@@ -6934,7 +7473,7 @@ SFT_FUNC void sft_arena_init(sft_arena* arena, u64 reserve_size) {
         arena->base = (u8*)mmap(NULL, reserve_size, PROT_READ | PROT_WRITE, 
             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (MAP_FAILED == arena->base) {
-            SFT_ERR_EXIT("mmap reserve failed for size %llu\n", reserve_size);
+            SFT_ERR_EXIT("mmap reserve failed for size %zu\n", reserve_size);
         }
 
         // pretend it's all committed
