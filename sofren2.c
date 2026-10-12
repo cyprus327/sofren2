@@ -62,6 +62,7 @@ enum sft_debug_mode {
     SFT_DEBUG_TILES,        // grid outlines over tiles
     SFT_DEBUG_DEPTH,        // normalized tile depth visualization
     SFT_DEBUG_LIGHT_COUNT,  // heatmap of active point lights per tile
+    SFT_DEBUG_CHECKERBOARD, // route all textures to the base checkerboard
     SFT_DEBUG_COUNT
 };
 
@@ -138,7 +139,7 @@ typedef u32 sft_mat_handle;
 #ifndef SFT_SHADOW_LIGHT_SIZE
     // physical radius of the light source in world units (e.g. 0.4m)
     // larger values widen the penumbra transition zone
-    #define SFT_SHADOW_LIGHT_SIZE 0.4f
+    #define SFT_SHADOW_LIGHT_SIZE 0.1f
 #endif
 
 // prime numbers for spatial hashing
@@ -806,7 +807,6 @@ SFT_FUNC void sft_draw_directional_light(sftvec dir, f32 r, f32 g, f32 b, f32 in
 //  every 'light_id' provided is expected to be unique
 SFT_FUNC void sft_draw_point_light(sftvec pos, f32 r, f32 g, f32 b, f32 intensity, f32 radius, u32 light_id);
 SFT_FUNC void sft_set_shadows_enabled(u8 enabled);
-SFT_FUNC void sft_invalidate_shadows(void);
 SFT_FUNC void sft_set_lightmap_brightness(f32 b);
 
 // texture functions
@@ -6126,6 +6126,11 @@ static SFT_INLINE void sft__resolve_tile(
                     }
                 }
 
+                if (SFT_DEBUG_CHECKERBOARD == sft_state->display.debug_mode) {
+                    tex_handle = sft_state->mat_pool.albedo_tex[SFT_MAT_INDEX(sft_state->base_mat)];
+                    base_color_int = 0xFFFFFFFF;
+                }
+
                 // decode base color
                 const vf32 inv255 = sft_vf_set1(1.f / 255.f);
                 const vf32 base_r = sft_vf_mul(sft_vf_set1((f32)((base_color_int >> 16) & 0xFF)), inv255);
@@ -6357,11 +6362,12 @@ static SFT_INLINE void sft__resolve_tile(
                     vf32 v_lum = sft_vf_add(v_lum_r, sft_vf_add(v_lum_g, v_lum_b));
                     
                     // normalize luminance to [0, 1] range (accounting for the overbrightening)
-                    v_lum = sft_vf_min(v_one, sft_vf_mul(v_lum, sft_vf_set1(1.f / sft_state->lighting.lightmap_brightness))); 
+                    v_lum = sft_vf_min(v_one, sft_vf_mul(v_lum, sft_vf_set1(1.f / sft_state->lighting.lightmap_brightness)));
 
                     // Scale the shadow strength by the baked luminance. 
                     // In dark areas, the dynamic shadow fades out, masking the hard occlusion pop.
-                    const vf32 masked_shadow = sft_vf_add(v_one, sft_vf_mul(sft_vf_sub(v_lightmap_shadow, v_one), v_lum));
+                    // const vf32 masked_shadow = sft_vf_add(v_one, sft_vf_mul(sft_vf_sub(v_lightmap_shadow, v_one), v_lum));
+                    const vf32 masked_shadow = v_lightmap_shadow;
 
                     const vf32 v_ambient_floor = sft_vf_set1(0.4f);
                     vf32 v_final_lm_mod = sft_vf_fmadd(masked_shadow, sft_vf_sub(v_one, v_ambient_floor), v_ambient_floor);
@@ -8084,6 +8090,7 @@ SFT_FUNC const char* sft_get_debug_name(enum sft_debug_mode mode) {
         case SFT_DEBUG_TILES: return "Tiles";
         case SFT_DEBUG_DEPTH: return "Depth";
         case SFT_DEBUG_LIGHT_COUNT: return "Light Count";
+        case SFT_DEBUG_CHECKERBOARD: return "Checkerboard";
         default: return "INVALID MODE";
     }
 }
@@ -8836,10 +8843,6 @@ SFT_FUNC void sft_draw_point_light(sftvec pos, f32 r, f32 g, f32 b, f32 intensit
 
 SFT_FUNC void sft_set_shadows_enabled(u8 enabled) {
     sft_state->shadows.enabled = enabled;
-}
-
-SFT_FUNC void sft_invalidate_shadows(void) {
-    // unused for now
 }
 
 SFT_FUNC void sft_set_lightmap_brightness(f32 b) {
