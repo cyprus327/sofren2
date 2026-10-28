@@ -172,6 +172,28 @@ typedef u32 sft_mat_handle;
 
 #define SFT_TILE_SHIFT 6
 #define SFT_TILE_SIZE (1 << SFT_TILE_SHIFT)
+#define SFT_TILE_PIXELS (SFT_TILE_SIZE * SFT_TILE_SIZE)
+
+#ifdef SFT_USE_AA
+    #ifndef SFT_AA_SAMPLES
+        // can be overridden to 2 if desired
+        #define SFT_AA_SAMPLES 4
+    #endif
+#else
+    #define SFT_AA_SAMPLES 1
+#endif
+
+// rotated grid super sampling offsets relative to pixel center (0.5, 0.5)
+#if SFT_AA_SAMPLES == 4
+    static const f32 sft_msaa_off_x[4] = { -0.125f,  0.375f, -0.375f,  0.125f };
+    static const f32 sft_msaa_off_y[4] = { -0.375f, -0.125f,  0.125f,  0.375f };
+#elif SFT_AA_SAMPLES == 2
+    static const f32 sft_msaa_off_x[2] = { -0.25f,  0.25f };
+    static const f32 sft_msaa_off_y[2] = { -0.25f,  0.25f };
+#else
+    static const f32 sft_msaa_off_x[1] = { 0.f };
+    static const f32 sft_msaa_off_y[1] = { 0.f };
+#endif
 
 #define SFT_INVALID_BITMASK_IND ((u64)-1)
 
@@ -5249,7 +5271,7 @@ static SFT_INLINE void sft__rast_simd_batch(
         
         u32 vid_payload_scalar;
         if (is_clipped) {
-            vid_payload_scalar = clip_slot | (1 << 31);
+            vid_payload_scalar = clip_slot | (1u << 31);
         }
         else {
             vid_payload_scalar = (inst_ind << (SFT_TRIANGLE_BITS + SFT_MESHLET_BITS)) | 
@@ -5290,7 +5312,28 @@ static SFT_INLINE void sft__rast_simd_batch(
         const f32 min_e1 = start_e1 + (lane_A1 < 0.f ? lane_A1 * box_w : 0.f) + (lane_B1 < 0.f ? lane_B1 * box_h : 0.f);
         const f32 min_e2 = start_e2 + (lane_A2 < 0.f ? lane_A2 * box_w : 0.f) + (lane_B2 < 0.f ? lane_B2 * box_h : 0.f);
 
-        const i32 trivial_accept = (min_e0 >= 0.f && min_e1 >= 0.f && min_e2 >= 0.f);
+        #ifdef SFT_USE_AA
+            const f32 aa_pad0 = 0.375f * (fabsf(lane_A0) + fabsf(lane_B0));
+            const f32 aa_pad1 = 0.375f * (fabsf(lane_A1) + fabsf(lane_B1));
+            const f32 aa_pad2 = 0.375f * (fabsf(lane_A2) + fabsf(lane_B2));
+            const i32 trivial_accept = (min_e0 >= aa_pad0 && min_e1 >= aa_pad1 && min_e2 >= aa_pad2);
+
+            // precompute per sample edge and depth offsets
+            vf32 v_sample_de0[SFT_AA_SAMPLES];
+            vf32 v_sample_de1[SFT_AA_SAMPLES];
+            vf32 v_sample_de2[SFT_AA_SAMPLES];
+            vf32 v_sample_dz[SFT_AA_SAMPLES];
+            for (i32 s = 0; s < SFT_AA_SAMPLES; s += 1) {
+                const f32 ox = sft_msaa_off_x[s];
+                const f32 oy = sft_msaa_off_y[s];
+                v_sample_de0[s] = sft_vf_set1(lane_A0 * ox + lane_B0 * oy);
+                v_sample_de1[s] = sft_vf_set1(lane_A1 * ox + lane_B1 * oy);
+                v_sample_de2[s] = sft_vf_set1(lane_A2 * ox + lane_B2 * oy);
+                v_sample_dz[s]  = sft_vf_set1(lane_dzdx * ox + lane_dzdy * oy);
+            }
+        #else
+            const i32 trivial_accept = (min_e0 >= 0.f && min_e1 >= 0.f && min_e2 >= 0.f);
+        #endif
 
         const vf32 v_dzdx_chunk = sft_vf_set1(lane_dzdx * SFT_SIMD_WIDTH);
         const vf32 v_dzdx_step = sft_vf_mul(sft_vf_set1(lane_dzdx), v_x_step);
@@ -5304,19 +5347,40 @@ static SFT_INLINE void sft__rast_simd_batch(
                 i32 p_ind = (y - tile_min_y) * SFT_TILE_SIZE + (aligned_min_x - tile_min_x);
 
                 for (i32 x = aligned_min_x; x < aligned_max_x; x += SFT_SIMD_WIDTH, p_ind += SFT_SIMD_WIDTH) {
-                    const vf32 old_z = sft_vf_load(&depth_buf[p_ind]);
-                    const vf32 final_mask = sft_vf_cmp_gt(v_z, old_z);
+                    #ifdef SFT_USE_AA
+                        for (i32 s = 0; s < SFT_AA_SAMPLES; s += 1) {
+                            const i32 s_ind = s * SFT_TILE_PIXELS + p_ind;
+                            const vf32 v_zs = sft_vf_add(v_z, v_sample_dz[s]);
+                            const vf32 old_z = sft_vf_load(&depth_buf[s_ind]);
+                            const vf32 final_mask = sft_vf_cmp_gt(v_zs, old_z);
+                            const i32 m_int = sft_vf_movemask(final_mask);
+                            if (((1 << SFT_SIMD_WIDTH) - 1) == m_int) {
+                                sft_vf_store(&depth_buf[s_ind], v_zs);
+                                sft_vf_store((f32*)&vid_buf[s_ind], v_payload);
+                            }
+                            else if (m_int) {
+                                sft_vf_store(&depth_buf[s_ind], sft_vf_blendv(v_zs, old_z, final_mask));
+                                const vf32 old_p = sft_vf_load((f32*)&vid_buf[s_ind]);
+                                sft_vf_store((f32*)&vid_buf[s_ind], sft_vf_blendv(v_payload, old_p, final_mask));
+                            }
+                        }
                     
-                    const i32 m_int = sft_vf_movemask(final_mask);
-                    if (((1 << SFT_SIMD_WIDTH) - 1) == m_int) {
-                        sft_vf_store(&depth_buf[p_ind], v_z);
-                        sft_vf_store((f32*)&vid_buf[p_ind], v_payload); 
-                    }
-                    else if (m_int) {
-                        sft_vf_store(&depth_buf[p_ind], sft_vf_blendv(v_z, old_z, final_mask));
-                        const vf32 old_p = sft_vf_load((f32*)&vid_buf[p_ind]);
-                        sft_vf_store((f32*)&vid_buf[p_ind], sft_vf_blendv(v_payload, old_p, final_mask));
-                    }
+                    #else
+                        const vf32 old_z = sft_vf_load(&depth_buf[p_ind]);
+                        const vf32 final_mask = sft_vf_cmp_gt(v_z, old_z);
+                        
+                        const i32 m_int = sft_vf_movemask(final_mask);
+                        if (((1 << SFT_SIMD_WIDTH) - 1) == m_int) {
+                            sft_vf_store(&depth_buf[p_ind], v_z);
+                            sft_vf_store((f32*)&vid_buf[p_ind], v_payload); 
+                        }
+                        else if (m_int) {
+                            sft_vf_store(&depth_buf[p_ind], sft_vf_blendv(v_z, old_z, final_mask));
+                            const vf32 old_p = sft_vf_load((f32*)&vid_buf[p_ind]);
+                            sft_vf_store((f32*)&vid_buf[p_ind], sft_vf_blendv(v_payload, old_p, final_mask));
+                        }
+                    #endif
+
                     v_z = sft_vf_add(v_z, v_dzdx_chunk);
                 }
                 v_z_row = sft_vf_add(v_z_row, v_dzdy);
@@ -5340,6 +5404,15 @@ static SFT_INLINE void sft__rast_simd_batch(
             vf32 v_e1_row = sft_vf_add(sft_vf_set1(start_e1), v_A1_step);
             vf32 v_e2_row = sft_vf_add(sft_vf_set1(start_e2), v_A2_step);
 
+            #ifdef SFT_USE_AA
+            // early out guard band:
+            // if pixel center e_i < -aa_pad_i for all lanes,
+            // no sub sample in any of the pixels can be >= 0
+            const vf32 v_neg_pad0 = sft_vf_set1(-aa_pad0);
+            const vf32 v_neg_pad1 = sft_vf_set1(-aa_pad1);
+            const vf32 v_neg_pad2 = sft_vf_set1(-aa_pad2);
+            #endif
+
             for (i32 y = min_y; y <= max_y; y += 1) {
                 vf32 v_e0 = v_e0_row;
                 vf32 v_e1 = v_e1_row;
@@ -5349,24 +5422,59 @@ static SFT_INLINE void sft__rast_simd_batch(
                 i32 p_ind = (y - tile_min_y) * SFT_TILE_SIZE + (aligned_min_x - tile_min_x);
 
                 for (i32 x = aligned_min_x; x < aligned_max_x; x += SFT_SIMD_WIDTH, p_ind += SFT_SIMD_WIDTH) {
-                    const vf32 geom_mask = sft_vf_and(sft_vf_cmp_ge(v_e0, v_zero), 
-                                           sft_vf_and(sft_vf_cmp_ge(v_e1, v_zero), sft_vf_cmp_ge(v_e2, v_zero)));
+                    #ifdef SFT_USE_AA
+                        // chunk level early out before testing the samples
+                        const vf32 might_hit = sft_vf_and(sft_vf_cmp_ge(v_e0, v_neg_pad0),
+                                            sft_vf_and(sft_vf_cmp_ge(v_e1, v_neg_pad1), sft_vf_cmp_ge(v_e2, v_neg_pad2)));
+                        if (sft_vf_movemask(might_hit)) {
+                            for (i32 s = 0; s < SFT_AA_SAMPLES; s += 1) {
+                                const vf32 v_e0s = sft_vf_add(v_e0, v_sample_de0[s]);
+                                const vf32 v_e1s = sft_vf_add(v_e1, v_sample_de1[s]);
+                                const vf32 v_e2s = sft_vf_add(v_e2, v_sample_de2[s]);
+
+                                const vf32 geom_mask = sft_vf_and(sft_vf_cmp_ge(v_e0s, v_zero),
+                                                    sft_vf_and(sft_vf_cmp_ge(v_e1s, v_zero), sft_vf_cmp_ge(v_e2s, v_zero)));
+                                if (sft_vf_movemask(geom_mask)) {
+                                    const i32 s_ind = s * SFT_TILE_PIXELS + p_ind;
+                                    const vf32 v_zs = sft_vf_add(v_z, v_sample_dz[s]);
+                                    const vf32 old_z = sft_vf_load(&depth_buf[s_ind]);
+                                    const vf32 final_mask = sft_vf_and(geom_mask, sft_vf_cmp_gt(v_zs, old_z));
+
+                                    const i32 m_int = sft_vf_movemask(final_mask);
+                                    if (((1 << SFT_SIMD_WIDTH) - 1) == m_int) {
+                                        sft_vf_store(&depth_buf[s_ind], v_zs);
+                                        sft_vf_store((f32*)&vid_buf[s_ind], v_payload);
+                                    }
+                                    else if (m_int) {
+                                        sft_vf_store(&depth_buf[s_ind], sft_vf_blendv(v_zs, old_z, final_mask));
+                                        const vf32 old_p = sft_vf_load((f32*)&vid_buf[s_ind]);
+                                        sft_vf_store((f32*)&vid_buf[s_ind], sft_vf_blendv(v_payload, old_p, final_mask));
+                                    }
+                                }
+                            }
+                        }
+
+                    #else
+                        const vf32 geom_mask = sft_vf_and(sft_vf_cmp_ge(v_e0, v_zero), 
+                            sft_vf_and(sft_vf_cmp_ge(v_e1, v_zero), sft_vf_cmp_ge(v_e2, v_zero)));
                     
-                    if (sft_vf_movemask(geom_mask)) {
-                        const vf32 old_z = sft_vf_load(&depth_buf[p_ind]);
-                        const vf32 final_mask = sft_vf_and(geom_mask, sft_vf_cmp_gt(v_z, old_z));
-                        
-                        const i32 m_int = sft_vf_movemask(final_mask);
-                        if (((1 << SFT_SIMD_WIDTH) - 1) == m_int) {
-                            sft_vf_store(&depth_buf[p_ind], v_z);
-                            sft_vf_store((f32*)&vid_buf[p_ind], v_payload); 
+                        if (sft_vf_movemask(geom_mask)) {
+                            const vf32 old_z = sft_vf_load(&depth_buf[p_ind]);
+                            const vf32 final_mask = sft_vf_and(geom_mask, sft_vf_cmp_gt(v_z, old_z));
+                            
+                            const i32 m_int = sft_vf_movemask(final_mask);
+                            if (((1 << SFT_SIMD_WIDTH) - 1) == m_int) {
+                                sft_vf_store(&depth_buf[p_ind], v_z);
+                                sft_vf_store((f32*)&vid_buf[p_ind], v_payload); 
+                            }
+                            else if (m_int) {
+                                sft_vf_store(&depth_buf[p_ind], sft_vf_blendv(v_z, old_z, final_mask));
+                                const vf32 old_p = sft_vf_load((f32*)&vid_buf[p_ind]);
+                                sft_vf_store((f32*)&vid_buf[p_ind], sft_vf_blendv(v_payload, old_p, final_mask));
+                            }
                         }
-                        else if (m_int) {
-                            sft_vf_store(&depth_buf[p_ind], sft_vf_blendv(v_z, old_z, final_mask));
-                            const vf32 old_p = sft_vf_load((f32*)&vid_buf[p_ind]);
-                            sft_vf_store((f32*)&vid_buf[p_ind], sft_vf_blendv(v_payload, old_p, final_mask));
-                        }
-                    }
+
+                    #endif
                     
                     v_e0 = sft_vf_add(v_e0, v_A0_chunk);
                     v_e1 = sft_vf_add(v_e1, v_A1_chunk);
@@ -5706,8 +5814,8 @@ static SFT_INLINE void sft__resolve_tile(
     vf32 v_tile_max = sft_vf_set1(-1e9f);
     const vf32 v_depth_threshold = sft_vf_set1(0.0001f);
     
-    // SFT_TILE_SIZE^2 pixels in SFT_SIMD_WIDTH steps
-    for (i32 i = 0; i < SFT_TILE_SIZE * SFT_TILE_SIZE; i += SFT_SIMD_WIDTH) {
+    // SFT_TILE_PIXELS * SFT_AA_SAMPLES in SFT_SIMD_WIDTH steps
+    for (i32 i = 0; i < SFT_TILE_PIXELS * SFT_AA_SAMPLES; i += SFT_SIMD_WIDTH) {
         const vf32 d = sft_vf_load(&depth_buf[i]);
         
         // mask out the empty background pixels (where depth is 0.0)
@@ -5900,9 +6008,16 @@ static SFT_INLINE void sft__resolve_tile(
     const vi32 v_ix_offsets = sft_vi_load(ix_offsets_arr);
     const vi32 v_iy_offsets = sft_vi_load(iy_offsets_arr);
 
+    #ifdef SFT_USE_AA
+        const vf32 v_inv_samples = sft_vf_set1(1.f / (f32)SFT_AA_SAMPLES);
+        const u32 cc = sft_state->display.clear_color;
+        const vf32 v_clear_r = sft_vf_set1(((f32)((cc >> 16) & 0xFF)) * (1.f / 255.f));
+        const vf32 v_clear_g = sft_vf_set1(((f32)((cc >> 8)  & 0xFF)) * (1.f / 255.f));
+        const vf32 v_clear_b = sft_vf_set1(((f32)((cc >> 0)  & 0xFF)) * (1.f / 255.f));
+    #endif
+
     for (i32 y = tile_min_y; y < limit_y; y += SFT_BLOCK_Y) {
         for (i32 x = tile_min_x; x < limit_x; x += SFT_BLOCK_X) {
-            
             // ---  2D block coord generation  ---
             const vi32 v_global_x = sft_vi_add(sft_vi_set1(x), v_ix_offsets);
             const vi32 v_global_y = sft_vi_add(sft_vi_set1(y), v_iy_offsets);
@@ -5919,45 +6034,148 @@ static SFT_INLINE void sft__resolve_tile(
             const vi32 v_local_x = sft_vi_sub(v_global_x, sft_vi_set1(tile_min_x));
             const vi32 v_local_y = sft_vi_sub(v_global_y, sft_vi_set1(tile_min_y));
             const vi32 v_p_ind = sft_vi_add(sft_vi_mullo(v_local_y, v_tile_size), v_local_x);
-            
-            const vi32 v_vids = sft_vi_gather((const int*)vid_buf, v_p_ind);
-            
-            const vi32 v_is_empty = sft_vi_cmp_eq(v_vids, v_empty_vid);
-            const vi32 v_is_valid = sft_vi_andnot(v_is_empty, v_in_bounds);
-            
-            i32 active_pixels = sft_vi_movemask(v_is_valid) & ((1 << SFT_SIMD_WIDTH) - 1);
 
-            // clear background
-            if (sft_state->display.should_clear) {
-                i32 empty_mask = sft_vi_movemask(sft_vi_and(v_is_empty, v_in_bounds)) & ((1 << SFT_SIMD_WIDTH) - 1);
-                while (empty_mask) {
-                    const i32 lane = sft__tzcnt(empty_mask);
-                    empty_mask &= (empty_mask - 1);
-                    const i32 px = x + ix_offsets_arr[lane];
-                    const i32 py = y + iy_offsets_arr[lane];
-                    sft_state->display.color_buffer[py * pitch + px] = sft_state->display.clear_color;
+            #ifdef SFT_USE_AA
+                vi32 v_vids_ms[SFT_AA_SAMPLES];
+                i32 active_sample_masks[SFT_AA_SAMPLES];
+                i32 active_pixels = 0;
+                vi32 v_empty_count = sft_vi_setzero();
+
+                for (i32 s = 0; s < SFT_AA_SAMPLES; s += 1) {
+                    v_vids_ms[s] = sft_vi_gather((const int*)&vid_buf[s * SFT_TILE_PIXELS], v_p_ind);
+                    const vi32 is_empty = sft_vi_cmp_eq(v_vids_ms[s], v_empty_vid);
+                    const vi32 is_valid = sft_vi_andnot(is_empty, v_in_bounds);
+                    
+                    active_sample_masks[s] = sft_vi_movemask(is_valid) & ((1 << SFT_SIMD_WIDTH) - 1);
+                    active_pixels |= active_sample_masks[s];
+
+                    v_empty_count = sft_vi_sub(v_empty_count, sft_vi_and(is_empty, v_in_bounds));
                 }
-            }
+
+                // entire block is 100% background
+                if (0 == active_pixels) {
+                    if (sft_state->display.should_clear) {
+                        i32 in_bounds_mask = sft_vi_movemask(v_in_bounds) & ((1 << SFT_SIMD_WIDTH) - 1);
+                        while (in_bounds_mask) {
+                            const i32 lane = sft__tzcnt(in_bounds_mask);
+                            in_bounds_mask &= (in_bounds_mask - 1);
+                            const i32 px = x + ix_offsets_arr[lane];
+                            const i32 py = y + iy_offsets_arr[lane];
+                            sft_state->display.color_buffer[py * pitch + px] = sft_state->display.clear_color;
+                        }
+                    }
+                    continue;
+                }
+
+                // initialize block color accumulators with background weight for partial edge pixels
+                const vf32 v_empty_weight = sft_vf_mul(sft_vf_cvtepi32(v_empty_count), v_inv_samples);
+                vf32 acc_r = sft_vf_setzero();
+                vf32 acc_g = sft_vf_setzero();
+                vf32 acc_b = sft_vf_setzero();
+
+                if (sft_state->display.should_clear) {
+                    acc_r = sft_vf_mul(v_clear_r, v_empty_weight);
+                    acc_g = sft_vf_mul(v_clear_g, v_empty_weight);
+                    acc_b = sft_vf_mul(v_clear_b, v_empty_weight);
+                }
+                else if (sft_vf_movemask(sft_vf_cmp_gt(v_empty_weight, v_zero))) {
+                    // preserve existing color_buffer background on partially covered edge pixels
+                    alignas(32) f32 bg_r[SFT_SIMD_WIDTH], bg_g[SFT_SIMD_WIDTH], bg_b[SFT_SIMD_WIDTH];
+                    const f32 inv255_s = 1.f / 255.f;
+                    for (i32 l = 0; l < SFT_SIMD_WIDTH; l += 1) {
+                        const i32 px = x + ix_offsets_arr[l];
+                        const i32 py = y + iy_offsets_arr[l];
+                        if (px < screen_w && py < screen_h) {
+                            const u32 c = sft_state->display.color_buffer[py * pitch + px];
+                            bg_r[l] = (f32)((c >> 16) & 0xFF) * inv255_s;
+                            bg_g[l] = (f32)((c >> 8)  & 0xFF) * inv255_s;
+                            bg_b[l] = (f32)((c >> 0)  & 0xFF) * inv255_s;
+                        }
+                        else {
+                            bg_r[l] = bg_g[l] = bg_b[l] = 0.f;
+                        }
+                    }
+                    acc_r = sft_vf_mul(sft_vf_load(bg_r), v_empty_weight);
+                    acc_g = sft_vf_mul(sft_vf_load(bg_g), v_empty_weight);
+                    acc_b = sft_vf_mul(sft_vf_load(bg_b), v_empty_weight);
+                }
+                // track all lanes in the block that touched at least one sample of geometry
+                const i32 block_write_mask = active_pixels;
+
+            #else // !AA
+                const vi32 v_vids = sft_vi_gather((const int*)vid_buf, v_p_ind);
+                
+                const vi32 v_is_empty = sft_vi_cmp_eq(v_vids, v_empty_vid);
+                const vi32 v_is_valid = sft_vi_andnot(v_is_empty, v_in_bounds);
+                
+                i32 active_pixels = sft_vi_movemask(v_is_valid) & ((1 << SFT_SIMD_WIDTH) - 1);
+
+                // clear background
+                if (sft_state->display.should_clear) {
+                    i32 empty_mask = sft_vi_movemask(sft_vi_and(v_is_empty, v_in_bounds)) & ((1 << SFT_SIMD_WIDTH) - 1);
+                    while (empty_mask) {
+                        const i32 lane = sft__tzcnt(empty_mask);
+                        empty_mask &= (empty_mask - 1);
+                        const i32 px = x + ix_offsets_arr[lane];
+                        const i32 py = y + iy_offsets_arr[lane];
+                        sft_state->display.color_buffer[py * pitch + px] = sft_state->display.clear_color;
+                    }
+                }
+
+            #endif // SFT_USE_AA
 
             if (0 == active_pixels) {
                 continue;
             }
 
             while (active_pixels) {
-                const i32 first_lane = sft__tzcnt(active_pixels);
-                
-                // extract target vid from the scalar array representation of the lane
-                // must use a scalar array load here because the vids array is contiguous 1D memory, 
-                // but the 2D block's actual visibility data was gathered into the vector register
-                alignas(32) u32 s_vids[SFT_SIMD_WIDTH];
-                sft_vi_store((vi32*)s_vids, v_vids);
-                const u32 target_vid = s_vids[first_lane];
+                #ifdef SFT_USE_AA
+                    i32 first_s = 0;
+                    while (0 == active_sample_masks[first_s]) {
+                        first_s += 1;
+                    }
+                    const i32 first_lane = sft__tzcnt(active_sample_masks[first_s]);
 
-                const vi32 v_target_vid = sft_vi_set1(target_vid);
-                const vi32 v_tri_mask = sft_vi_and(sft_vi_cmp_eq(v_vids, v_target_vid), v_in_bounds);
-                
-                const i32 tri_lanes = sft_vi_movemask(v_tri_mask) & active_pixels;
-                active_pixels &= ~tri_lanes;
+                    alignas(32) u32 s_vids[SFT_SIMD_WIDTH];
+                    sft_vi_store((vi32*)s_vids, v_vids_ms[first_s]);
+                    const u32 target_vid = s_vids[first_lane];
+                    const vi32 v_target_vid = sft_vi_set1(target_vid);
+
+                    vi32 v_sample_hits = sft_vi_setzero();
+                    vi32 v_tri_mask = sft_vi_setzero();
+                    i32 tri_lanes = 0;
+
+                    for (i32 s = 0; s < SFT_AA_SAMPLES; s += 1) {
+                        const vi32 match = sft_vi_and(sft_vi_cmp_eq(v_vids_ms[s], v_target_vid), v_in_bounds);
+                        const i32 m_mask = sft_vi_movemask(match) & active_sample_masks[s];
+                        
+                        active_sample_masks[s] &= ~m_mask;
+                        tri_lanes |= m_mask;
+                        v_tri_mask = sft_vi_or(v_tri_mask, match);
+                        
+                        v_sample_hits = sft_vi_sub(v_sample_hits, match);
+                    }
+
+                    active_pixels = 0;
+                    for (i32 s = 0; s < SFT_AA_SAMPLES; s += 1) {
+                        active_pixels |= active_sample_masks[s];
+                    }
+
+                    const vf32 v_sample_weight = sft_vf_mul(sft_vf_cvtepi32(v_sample_hits), v_inv_samples);
+
+                #else
+                    const i32 first_lane = sft__tzcnt(active_pixels);
+                    alignas(32) u32 s_vids[SFT_SIMD_WIDTH];
+                    sft_vi_store((vi32*)s_vids, v_vids);
+                    const u32 target_vid = s_vids[first_lane];
+
+                    const vi32 v_target_vid = sft_vi_set1(target_vid);
+                    const vi32 v_tri_mask = sft_vi_and(sft_vi_cmp_eq(v_vids, v_target_vid), v_in_bounds);
+                    
+                    const i32 tri_lanes = sft_vi_movemask(v_tri_mask) & active_pixels;
+                    active_pixels &= ~tri_lanes;
+
+                #endif
 
                 u32 inst_ind, m_ind;
                 vf32 sx0, sy0, inv_w0, u0, v0, lu0, lv0;
@@ -6061,9 +6279,25 @@ static SFT_INLINE void sft__resolve_tile(
                 const vf32 v_px_sub_sx0 = sft_vf_sub(v_px, sx0);
                 const vf32 v_py_sub_sy0 = sft_vf_sub(v_py, sy0);
 
-                const vf32 bu = sft_vf_mul(sft_vf_sub(sft_vf_mul(v_px_sub_sx0, v_dy2), sft_vf_mul(v_py_sub_sy0, v_dx2)), v_inv_det);
-                const vf32 bv = sft_vf_mul(sft_vf_sub(sft_vf_mul(v_py_sub_sy0, v_dx1), sft_vf_mul(v_px_sub_sx0, v_dy1)), v_inv_det);
-                const vf32 bw = sft_vf_sub(sft_vf_sub(v_one, bu), bv);
+                const vf32 raw_bu = sft_vf_mul(sft_vf_sub(sft_vf_mul(v_px_sub_sx0, v_dy2), sft_vf_mul(v_py_sub_sy0, v_dx2)), v_inv_det);
+                const vf32 raw_bv = sft_vf_mul(sft_vf_sub(sft_vf_mul(v_py_sub_sy0, v_dx1), sft_vf_mul(v_px_sub_sx0, v_dy1)), v_inv_det);
+                const vf32 raw_bw = sft_vf_sub(sft_vf_sub(v_one, raw_bu), raw_bv);
+
+                #ifdef SFT_USE_AA
+                    // clamp barycentrics to triangle domain so sub samples whose pixel center
+                    // lies slightly outside the edge never extrapolate UVs, lightmaps, or 1/w
+                    vf32 bu = sft_vf_max(v_zero, raw_bu);
+                    vf32 bv = sft_vf_max(v_zero, raw_bv);
+                    vf32 bw = sft_vf_max(v_zero, raw_bw);
+                    const vf32 b_sum_inv = sft_vf_rcp_refined(sft_vf_add(bu, sft_vf_add(bv, bw)));
+                    bu = sft_vf_mul(bu, b_sum_inv);
+                    bv = sft_vf_mul(bv, b_sum_inv);
+                    bw = sft_vf_mul(bw, b_sum_inv);
+                #else
+                    const vf32 bu = raw_bu;
+                    const vf32 bv = raw_bv;
+                    const vf32 bw = raw_bw;
+                #endif
 
                 const vf32 v_inv_z = sft_vf_fmadd(bw, inv_w0, sft_vf_fmadd(bu, inv_w1, sft_vf_mul(bv, inv_w2)));
                 const vf32 v_z = sft_vf_rcp_refined(v_inv_z);
@@ -6419,26 +6653,61 @@ static SFT_INLINE void sft__resolve_tile(
                     final_b = sft_vf_blendv(v_zero, final_b, is_edge);
                 }
 
-                // re pack to 8 bit integer
+                #ifdef SFT_USE_AA
+                    final_r = sft_vf_max(v_zero, sft_vf_min(final_r, v_one));
+                    final_g = sft_vf_max(v_zero, sft_vf_min(final_g, v_one));
+                    final_b = sft_vf_max(v_zero, sft_vf_min(final_b, v_one));
+
+                    const vf32 v_lane_weight = sft_vf_and(v_sample_weight, sft_vf_cast_vi32(v_tri_mask));
+                    
+                    acc_r = sft_vf_fmadd(final_r, v_lane_weight, acc_r);
+                    acc_g = sft_vf_fmadd(final_g, v_lane_weight, acc_g);
+                    acc_b = sft_vf_fmadd(final_b, v_lane_weight, acc_b);
+                #else
+                    // re pack to 8 bit integer
+                    const vf32 v_255 = sft_vf_set1(255.f);
+                    final_r = sft_vf_mul(sft_vf_max(v_zero, sft_vf_min(final_r, v_one)), v_255);
+                    final_g = sft_vf_mul(sft_vf_max(v_zero, sft_vf_min(final_g, v_one)), v_255);
+                    final_b = sft_vf_mul(sft_vf_max(v_zero, sft_vf_min(final_b, v_one)), v_255);
+
+                    const vi32 v_color = sft_vi_or(sft_vi_set1(0xFF000000),
+                        sft_vi_or(sft_vi_slli(sft_vi_cvttps_epi32(final_r), 16),
+                        sft_vi_or(sft_vi_slli(sft_vi_cvttps_epi32(final_g), 8), sft_vi_cvttps_epi32(final_b))));
+
+                    // masked write to screen
+                    i32 store_mask = tri_lanes;
+                    while (store_mask) {
+                        const i32 lane = sft__tzcnt(store_mask);
+                        store_mask &= (store_mask - 1);
+                        const i32 px = x + ix_offsets_arr[lane];
+                        const i32 py = y + iy_offsets_arr[lane];
+                        sft_state->display.color_buffer[py * pitch + px] = sft_vi_extract(v_color, lane);
+                    }
+                #endif
+            }
+
+            #ifdef SFT_USE_AA
                 const vf32 v_255 = sft_vf_set1(255.f);
-                final_r = sft_vf_mul(sft_vf_max(v_zero, sft_vf_min(final_r, v_one)), v_255);
-                final_g = sft_vf_mul(sft_vf_max(v_zero, sft_vf_min(final_g, v_one)), v_255);
-                final_b = sft_vf_mul(sft_vf_max(v_zero, sft_vf_min(final_b, v_one)), v_255);
+                acc_r = sft_vf_mul(sft_vf_min(acc_r, v_one), v_255);
+                acc_g = sft_vf_mul(sft_vf_min(acc_g, v_one), v_255);
+                acc_b = sft_vf_mul(sft_vf_min(acc_b, v_one), v_255);
 
                 const vi32 v_color = sft_vi_or(sft_vi_set1(0xFF000000),
-                    sft_vi_or(sft_vi_slli(sft_vi_cvttps_epi32(final_r), 16),
-                    sft_vi_or(sft_vi_slli(sft_vi_cvttps_epi32(final_g), 8), sft_vi_cvttps_epi32(final_b))));
+                    sft_vi_or(sft_vi_slli(sft_vi_cvttps_epi32(acc_r), 16),
+                    sft_vi_or(sft_vi_slli(sft_vi_cvttps_epi32(acc_g), 8), sft_vi_cvttps_epi32(acc_b))));
 
-                // masked write to screen
-                i32 store_mask = tri_lanes;
-                while (store_mask) {
-                    const i32 lane = sft__tzcnt(store_mask);
-                    store_mask &= (store_mask - 1);
+                i32 block_store_mask = sft_state->display.should_clear
+                    ? (sft_vi_movemask(v_in_bounds) & ((1 << SFT_SIMD_WIDTH) - 1))
+                    : block_write_mask;
+
+                while (block_store_mask) {
+                    const i32 lane = sft__tzcnt(block_store_mask);
+                    block_store_mask &= (block_store_mask - 1);
                     const i32 px = x + ix_offsets_arr[lane];
                     const i32 py = y + iy_offsets_arr[lane];
                     sft_state->display.color_buffer[py * pitch + px] = sft_vi_extract(v_color, lane);
                 }
-            }
+            #endif
         }
     }
 
@@ -6460,8 +6729,8 @@ static SFT_INLINE void sft__worker_phase_rasterize(void) {
     const vf32 v_x_step = sft_vf_load(x_offsets_arr);
     const vf32 v_zero = sft_vf_setzero();
 
-    alignas(64) f32 depth_buf[SFT_TILE_SIZE * SFT_TILE_SIZE];
-    alignas(64) u32 vid_buf[SFT_TILE_SIZE * SFT_TILE_SIZE];
+    alignas(64) f32 depth_buf[SFT_TILE_PIXELS * SFT_AA_SAMPLES];
+    alignas(64) u32 vid_buf[SFT_TILE_PIXELS * SFT_AA_SAMPLES];
 
     while (1) {
         const i32 queue_ind = sft_atomic_add(&sft_state->next_tile_ind.count, 1);
@@ -6479,8 +6748,8 @@ static SFT_INLINE void sft__worker_phase_rasterize(void) {
         const i32 tile_max_x = tile_min_x + SFT_TILE_SIZE;
         const i32 tile_max_y = tile_min_y + SFT_TILE_SIZE;
 
-        memset(depth_buf, 0, SFT_TILE_SIZE * SFT_TILE_SIZE * sizeof(f32));
-        memset(vid_buf, 0xFF, SFT_TILE_SIZE * SFT_TILE_SIZE * sizeof(u32));
+        memset(depth_buf, 0, SFT_TILE_PIXELS * SFT_AA_SAMPLES * sizeof(f32));
+        memset(vid_buf, 0xFF, SFT_TILE_PIXELS * SFT_AA_SAMPLES * sizeof(u32));
 
         i32 current_chunk_ind = sft_state->display.tile_heads[tile_ind];
 
