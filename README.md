@@ -40,7 +40,7 @@ Sponza at 260 FPS (rendered at 1920x1080, no gamma correction)
 
 - **Multithreaded Rasterizer:** Tile based multithreaded rendering pipeline utilizing a custom job system and lock free binning
 - **Explicit SIMD Vectorization:** Hardware accelerated processing via AVX2 and ARM NEON, with everything designed around a SoA layout
-- **Meshlet Driven Pipeline:** Geometry is pre processed into optimized 64 vertex meshlets, enabling aggressive early out frustum and normal cone backface culling
+- **Meshlet Driven Pipeline:** Geometry is pre processed into optimized `SFT_VERTS_PER_MESHLET` (64 default) vertex meshlets, enabling aggressive early out frustum and normal cone backface culling
 - **Analytical Soft Shadows:** High performance soft shadows calculated via raymarching against dynamic capsule proxies, completely bypassing traditional shadow maps
 - **Skeletal Animation:** Full hierarchical skeletal animation and 4 joint skinning evaluated directly within the meshlet pipeline
 - **Cache Optimized Texturing:** Textures are automatically swizzled into 4x4 blocks to maximize CPU cache hits, supporting mipmapping, bilinear, and nearest filtering
@@ -50,6 +50,7 @@ Sponza at 260 FPS (rendered at 1920x1080, no gamma correction)
 - **Custom Virtual Memory Arenas:** Sub allocates from massive up front OS level virtual memory reservations to eliminate standard heap fragmentation
 - **Asset Pipelines:** Parses GLB/glTF assets natively via `cgltf`, alongside a custom `QSF2` binary format
 - **Built in Profilers:** Real time visualizers for wireframe, tile loads, depth buffers, light heatmaps, and checkerboard texture
+- **MSAA (4x and 2x)** Built in high performance (still expensive, but much higher perofmrance than if it was done post present) anti aliasing
 
 ## Not Yet Implemented
 
@@ -74,7 +75,7 @@ the engine processes geometry into a cached state, bins triangles into screen sp
 
 The main thread pushes meshlet jobs to a global lock free queue, and worker threads begin pulling them
 
-- **Meshlet Culling & Skinning:** Each job evaluates up to 8 meshlets, threads first check the meshlet's bounding sphere and normal cone against the camera frustum,
+- **Meshlet Culling & Skinning:** Each job evaluates up to `SFT_MESHLETS_PER_JOB` (8 default) meshlets, threads first check the meshlet's bounding sphere and normal cone against the camera frustum,
 if the meshlet survives, its vertices are transformed and skinned
 - **Screen-Space Caching:** Transformed world space positions, normals, and projected clip space coordinates are written to a large contiguous "G buffer" array
 - **Clipping & Binning:** Triangles intersecting the near plane are dynamically clipped into sub triangles, valid triangles have their 2D bounding boxes
