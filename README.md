@@ -113,6 +113,12 @@ There is no real reason that it is a .c file instead of a .h file, it doesn't ne
 
 *More videos/screenshots coming*
 
+Showing all of the debug modes
+
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/413830f7-10e2-445f-95ff-01f3a302d1ce" width="100%" autoplay loop muted playsinline controls></video>
+</div>
+
 Quake II rendering with [sofren](https://github.com/cyprus327/sofren/) (click to view video)
 [![Quake II Demo Video](https://img.youtube.com/vi/hax09bEz7jo/maxresdefault.jpg)](https://www.youtube.com/watch?v=hax09bEz7jo)
 
