@@ -29,28 +29,57 @@ using a multithreaded, tile based rendering pipeline with an advanced meshlet ar
 Sponza at 260 FPS (rendered at 1920x1080, no gamma correction)
 <details>
   <summary>About...</summary>
-  This looks washed out because gamma correction isn't in sofren2, it would take like 10 lines to add it I just haven't yet.
+  This looks washed out because gamma correction isn't in sofren2 yet.
   This was rendered with 32 worker threads and AVX2 on a laptop with an Intel i9-13900HX.
 </details>
 <img width="959" height="503" alt="image" src="https://github.com/user-attachments/assets/e70fd3fc-8ba0-40e3-bd87-35c72b39aa2e" />
 
 ## Core Features
 
-*See the [Architecture](#architecture) section for more info on these*
+<details>
+  <summary><b>Multithreaded Rasterizer & Lock Free Binning</b></summary>
+  Implements a deferred tile-based visibility buffer pipeline utilizing a custom job system. Threads process geometry and write 64-bit packed payloads (instance ID, meshlet ID, batch index, active lane mask) to thread-local chunk allocators, completely avoiding atomic locks during screen-space binning.
+</details>
 
-- **Multithreaded Rasterizer:** Tile based multithreaded rendering pipeline utilizing a custom job system and lock free binning
-- **Explicit SIMD Vectorization:** Hardware accelerated processing via AVX2 and ARM NEON, with everything designed around a SoA layout
-- **Meshlet Driven Pipeline:** Geometry is pre processed into optimized `SFT_VERTS_PER_MESHLET` (64 default) vertex meshlets, enabling aggressive early out frustum and normal cone backface culling
-- **Analytical Soft Shadows:** High performance soft shadows calculated via raymarching against dynamic capsule proxies, completely bypassing traditional shadow maps
-- **Skeletal Animation:** Full hierarchical skeletal animation and 4 joint skinning evaluated directly within the meshlet pipeline
-- **Cache Optimized Texturing:** Textures are automatically swizzled into 4x4 blocks to maximize CPU cache hits, supporting mipmapping, bilinear, and nearest filtering
-- **Dynamic & Baked Lighting:** Supports physical point and directional lights (Blinn-Phong) alongside overbrightened baked lightmap atlases
-- **Immediate Mode Geometry (`dmesh`):** Built in API for dynamically generating primitives (cubes, spheres, capsules, cylinders) and custom geometry on the fly
-- **BVH Accelerated Raycasting:** Integrated raycasting against the exact posed geometry of active instances for precise collision and picking
-- **Custom Virtual Memory Arenas:** Sub allocates from massive up front OS level virtual memory reservations to eliminate standard heap fragmentation
-- **Asset Pipelines:** Parses GLB/glTF assets natively via `cgltf`, alongside a custom `QSF2` binary format
-- **Built in Profilers:** Real time visualizers for wireframe, tile loads, depth buffers, light heatmaps, and checkerboard texture
-- **MSAA (4x and 2x)** Built in high performance (still expensive, but much higher perofmrance than if it was done post present) anti aliasing
+<details>
+  <summary><b>Explicit SIMD Vectorization & SoA Layout</b></summary>
+  Hardware accelerated processing via explicit AVX2 and ARM NEON intrinsics, all internal data structures utilize a Structure of Arrays layout to maximize register and lane utilization.
+</details>
+
+<details>
+  <summary><b>Meshlet Driven Pipeline</b></summary>
+  Geometry is preprocessed into optimized `SFT_VERTS_PER_MESHLET` (64 default) vertex meshlets, which enables aggressive early out frustum checks (via bounding spheres) and normal-cone backface culling before any vertices are (expensively) transformed or skinned.
+</details>
+
+<details>
+  <summary><b>Analytical Soft Shadows & 8-Way SIMD BVH</b></summary>
+  High performance perfectly soft shadows are calculated via raymarching against dynamic capsule proxies, entirely bypassing traditional shadow maps. Raycasting traverses an 8-branching BVH where each node stores 8 child AABBs in SoA layout, testing against 8 bounding boxes simultaneously.
+</details>
+
+<details>
+  <summary><b>OS Level Virtual Memory Arenas</b></summary>
+  Eliminates standard heap fragmentation and per frame `malloc` overhead by reserving large blocks of virtual address space upfront (`VirtualAlloc` / `mmap`), with physical memory pages strictly committed on demand when bump pointers cross page boundaries.
+</details>
+
+<details>
+  <summary><b>Cache Optimized Texturing</b></summary>
+  Textures are automatically swizzled into 4x4 Morton style blocks to maximize CPU cache hits during sampling. Supports mipmapping alongside bilinear and nearest filtering.
+</details>
+
+<details>
+  <summary><b>Skeletal Animation</b></summary>
+  Full hierarchical skeletal animation and 4-joint skinning evaluated directly within the meshlet pipeline.
+</details>
+
+<details>
+  <summary><b>Immediate Mode Geometry (dmesh)</b></summary>
+  Built in API for dynamically generating primitives (cubes, spheres, capsules, cylinders) and custom geometry on the fly.
+</details>
+
+<details>
+  <summary><b>Built in Profilers & Anti Aliasing</b></summary>
+  Realtime visualizers for wireframe, tile loads, depth buffers, light heatmaps, and checkerboard textures. Also features built in high performance 2x and 4x MSAA.
+</details>
 
 ## Not Yet Implemented
 
@@ -63,67 +92,6 @@ All of these things exist in the original [sofren](https://github.com/cyprus327/
 - OBJ file loading
 - PBR textures (metallic/roughness and normals), this probably won't be implemented due to how extreme the performance decrease is for fairly little visual benefit
 - Standard shadowmaps
-
-## Architecture
-
-sofren2 is structured around a parallel tile based visibility buffer pipeline, where instead of rendering triangles immediately to a global framebuffer
-the engine processes geometry into a cached state, bins triangles into screen space tiles, and then resolves the final image tile by tile
-
-### The Rendering Pipeline
-
-#### 1: Geometry Processing & Binning
-
-The main thread pushes meshlet jobs to a global lock free queue, and worker threads begin pulling them
-
-- **Meshlet Culling & Skinning:** Each job evaluates up to `SFT_MESHLETS_PER_JOB` (8 default) meshlets, threads first check the meshlet's bounding sphere and normal cone against the camera frustum,
-if the meshlet survives, its vertices are transformed and skinned
-- **Screen-Space Caching:** Transformed world space positions, normals, and projected clip space coordinates are written to a large contiguous "G buffer" array
-- **Clipping & Binning:** Triangles intersecting the near plane are dynamically clipped into sub triangles, valid triangles have their 2D bounding boxes
-calculated and are assigned to underlying screen tiles
-- **Lock Free Payloads:** Instead of storing full triangle data in tiles, the engine packs a 64 bit payload containing the instance ID, meshlet ID,
-batch index, and an active lane mask, these payloads are written to thread local chunk allocators to completely avoid atomic locks during binning
-
-Before proceeding, the main thread intercepts the pipeline to sort the tiles by their payload counts (heaviest to lightest), ensuring optimal load balancing for the rasterization phase
-
-#### 2: Rasterization (Visibility Buffer)
-
-Workers switch to grabbing tiles from the sorted queue
-
-- **SIMD Edge Equations:** For each tile, threads iterate through its linked list of payload chunks, payloads are unpacked and the cached screen space vertices
-are fetched, the engine evaluates edge equations and depth gradients, rasterizing up to 8 triangles simultaneously depending on the hardware target
-- **Local Depth Buffers:** Depth and visibility data (the unpacked payload IDs) are written to tile local arrays
-
-#### 3: Shading & Resolve
-
-Once a tile's geometry is fully rasterized, the thread resolves the final pixel colors
-
-- **Barycentric Reconstruction:** For every visible pixel, the engine unpacks the stored ID, fetches the triangle vertices from the global cache,
-and calculates perspective correct barycentric coordinates
-- **Texture & Lightmap Sampling:** Using analytic gradients calculated from the barycentric coordinates, the engine selects the appropriate
-mipmap level, texture data is fetched from swizzled 4x4 Morton style blocks via nearest or bilinear filtering
-- **Analytical Soft Shadows:** If dynamic shadows are enabled, the engine calculates analytical capsule based penumbras, it builds a tight 2D frustum
-from the active pixel cluster to the light source, checks against a TLAS of bounding boxes, and traces rays against overlapping geometry and dynamic joint capsules
-- **Final Output:** The shaded pixels are written to the global color buffer, and the thread pulls the next tile
-
-### Memory Architecture
-
-sofren2 eliminates traditional heap fragmentation and the overhead of per frame `malloc` calls by implementing OS level virtual memory arenas
-
-- **Virtual Reservations:** Arenas reserve massive blocks of virtual address space up front
-- **On Demand Commits:** Physical memory pages are strictly committed only when the bump pointer crosses a physical page boundary
-(handling Windows `VirtualAlloc` explicitly and POSIX `mmap` page faults implicitly)
-- **Transient Lifetimes:** Arenas are categorized by lifespan, for example some are wiped clean at the start of every frame simply by
-resetting their bump pointers to zero
-- **Texture Heap Allocator:** Rather than relying on individual texture allocations, the engine sub allocates from a large continuous
-virtual memory block using a linked list block allocator, with block splitting and merging to prevent fragmentation during runtime loading and unloading
-
-### SIMD & Data Layout
-
-The engine is written around a custom explicit SIMD wrapper supporting AVX2 (8 wide), ARM NEON (4 wide), and scalar fallbacks, and to feed these
-registers efficiently all internal data structures use a SoA layout
-
-- **8 way BVH:** To maximize SIMD utilization during raycasting and analytical shadow evaluation, an 8 way BVH is used where each node stores 8
-child AABBs in parallel arrays, allowing the engine to test a ray or frustum against 8 bounding boxes simultaneously
 
 ## Integration & Quick Start
 
@@ -144,6 +112,12 @@ There is no real reason that it is a .c file instead of a .h file, it doesn't ne
 ## Gallery
 
 *More videos/screenshots coming*
+
+Showing all of the debug modes
+
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/413830f7-10e2-445f-95ff-01f3a302d1ce" width="100%" autoplay loop muted playsinline controls></video>
+</div>
 
 Quake II rendering with [sofren](https://github.com/cyprus327/sofren/) (click to view video)
 [![Quake II Demo Video](https://img.youtube.com/vi/hax09bEz7jo/maxresdefault.jpg)](https://www.youtube.com/watch?v=hax09bEz7jo)
