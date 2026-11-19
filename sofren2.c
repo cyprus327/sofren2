@@ -2136,12 +2136,21 @@ static SFT_INLINE i32 sft__aabb_vs_sphere(sftvec b_min, sftvec b_max, sftvec cen
     return d2 <= (radius * radius);
 }
 
+// static SFT_INLINE i32 sft__fast_log2(i32 val) {
+//     i32 res = 0;
+//     while (val >>= 1) {
+//         res += 1;
+//     }
+//     return res;
+// }
 static SFT_INLINE i32 sft__fast_log2(i32 val) {
-    i32 res = 0;
-    while (val >>= 1) {
-        res += 1;
-    }
-    return res;
+    #if defined(__GNUC__) || defined(__clang__)
+        return 31 - __builtin_clz((u32)val);
+    #else
+        unsigned long r;
+        _BitScanReverse(&r, (unsigned long)val);
+        return (i32)r;
+    #endif
 }
 
 static SFT_INLINE void sft__swizzle_rgba_to_argb(u32* pixels, i32 count) {
@@ -4074,7 +4083,6 @@ static SFT_INLINE void sft__build_packet_frustum(
     out_frustum->abs_normal[5].z = sft_vf_set1(fabsf(lf.z));
 }
 
-
 static SFT_INLINE vf32 sft__trace_shadow_packet(
     sftvvec ray_orig, sftvvec L_raw, vf32 active_mask, 
     sftvec light_pos, f32 light_radius, u8 static_only
@@ -5100,8 +5108,7 @@ static SFT_INLINE void sft__worker_phase_geom(struct sft_thread_bin_state* local
                          tz = sft_vf_fmadd(v_world.y, v_vp.m[1][2], tz); 
                          tz = sft_vf_fmadd(v_world.x, v_vp.m[0][2], tz);
 
-                    const vf32 approx_w = sft_vf_rcp_refined(w);
-                    const vf32 inv_w = sft_vf_mul(approx_w, sft_vf_fnmadd(w, approx_w, v_two));
+                    const vf32 inv_w = sft_vf_rcp_refined(w);
                     const vf32 sx = sft_vf_fmadd(tx, sft_vf_mul(inv_w, v_scale_x), v_bias_x);
                     const vf32 sy = sft_vf_fmadd(ty, sft_vf_mul(inv_w, v_scale_y), v_bias_y);
 
@@ -5867,6 +5874,9 @@ static SFT_INLINE void sft__resolve_tile(
             // linear bounds
             const f32 linear_min = w - radius;
             const f32 linear_max = w + radius;
+            if (linear_max <= SFT_EPSILON) {
+                continue; // entire light sphere is behind the camera
+            }
 
             // if the light's volume clips behind the camera
             const f32 safe_linear_min = (linear_min > SFT_EPSILON) ? linear_min : SFT_EPSILON;
@@ -5895,8 +5905,8 @@ static SFT_INLINE void sft__resolve_tile(
                 const f32 safe_w = SFT_MAX(w - radius, SFT_EPSILON);
 
                 // scale the radius using the pure projection factors, not the view dependent ones
-                const f32 rx_screen = fabsf((radius * proj_scale_x) / safe_w * hw);
-                const f32 ry_screen = fabsf((radius * proj_scale_y) / safe_w * hh);
+                const f32 rx_screen = ((radius * proj_scale_x) + fabsf(tx) * (radius / w)) / safe_w * hw;
+                const f32 ry_screen = ((radius * proj_scale_y) + fabsf(ty) * (radius / w)) / safe_w * hh;
 
                 const f32 l_min_x = sx - rx_screen;
                 const f32 l_max_x = sx + rx_screen;
@@ -6403,6 +6413,15 @@ static SFT_INLINE void sft__resolve_tile(
                 const vf32 v_specular_scale = sft_vf_set1(((mat_shininess + 8.f) / 8.f) * 0.04f);
                 const u8 is_lightmapped = (0xFFFFFFFF != lm_page);
 
+                if (mat_shininess < 0.f) {
+                    // fullbright/unlit material
+                    const vf32 v_emissive = sft_vf_set1(-mat_shininess);
+                    final_r = sft_vf_mul(albedo_r, v_emissive);
+                    final_g = sft_vf_mul(albedo_g, v_emissive);
+                    final_b = sft_vf_mul(albedo_b, v_emissive);
+                    goto SKIP_LIGHTING;
+                }
+
                 // ---  1, base lighting  ---
                 if (is_lightmapped) {
                     const sft_tex_handle lm_handle = inst->model->lightmaps[lm_page];
@@ -6620,6 +6639,8 @@ static SFT_INLINE void sft__resolve_tile(
                     final_b = sft_vf_fmadd(albedo_b, diffuse_b, spec_b);
                 }
 
+                SKIP_LIGHTING:;
+
                 // ---  wireframe debug  ---
                 if (SFT_DEBUG_WIREFRAME == sft_state->display.debug_mode) {
                     const vi32 abs_mask = sft_vi_set1(0x7FFFFFFF);
@@ -6676,12 +6697,24 @@ static SFT_INLINE void sft__resolve_tile(
 
                     // masked write to screen
                     i32 store_mask = tri_lanes;
-                    while (store_mask) {
-                        const i32 lane = sft__tzcnt(store_mask);
-                        store_mask &= (store_mask - 1);
-                        const i32 px = x + ix_offsets_arr[lane];
-                        const i32 py = y + iy_offsets_arr[lane];
-                        sft_state->display.color_buffer[py * pitch + px] = sft_vi_extract(v_color, lane);
+                    #if defined(__AVX2__)
+                    if (0xFF == store_mask) {
+                        u32* row0 = &sft_state->display.color_buffer[y * pitch + x];
+                        u32* row1 = &sft_state->display.color_buffer[(y + 1) * pitch + x];
+                        _mm_storeu_si128((__m128i*)row0, _mm256_castsi256_si128(v_color));
+                        _mm_storeu_si128((__m128i*)row1, _mm256_extracti128_si256(v_color, 1));
+                    } else
+                    #endif
+                    {
+                        alignas(32) u32 s_color[SFT_SIMD_WIDTH];
+                        sft_vi_store(s_color, v_color);
+                        while (store_mask) {
+                            const i32 lane = sft__tzcnt(store_mask);
+                            store_mask &= (store_mask - 1);
+                            const i32 px = x + ix_offsets_arr[lane];
+                            const i32 py = y + iy_offsets_arr[lane];
+                            sft_state->display.color_buffer[py * pitch + px] = s_color[lane];
+                        }
                     }
                 #endif
             }
@@ -6827,10 +6860,7 @@ static void sft__worker_thread(void* user_data) {
 
         // ---  rasterization pass  ---
         sft__worker_phase_rasterize();
-        sft__barrier_wait(&sft_state->raster_barrier); 
-        
-        // final synchronize and cleanup
-        sft__barrier_wait(&sft_state->raster_barrier); 
+        // no barrier wait needed here since main thread already blocks on sft_sem_wait(&sft_state->sem_done)
         
         sft_sem_post(&sft_state->sem_done, 1);
     }
